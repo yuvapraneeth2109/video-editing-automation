@@ -1,6 +1,6 @@
 # Roothoot Video Editor
 
-Upload any number of clips, put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion and a text pill (caption) to any clip, a voiceover (one for the whole video or one per clip) and background music, and export one MP4 with the Roothoot logo as an animated intro and outro.
+Upload any number of video clips and photos (each photo shown for a chosen number of seconds), put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion and a text pill (caption) to any clip, a voiceover (one for the whole video or one per clip) and background music, and export one MP4 with the Roothoot logo as an animated intro and outro.
 
 **Live:** deployed on Vercel (free tier) — static site, no backend.
 

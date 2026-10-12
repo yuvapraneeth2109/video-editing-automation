@@ -50,7 +50,8 @@ type Clip = {
   transition: Transition;
 } & (
   | { status: 'probing' }
-  | { status: 'ready'; info: ClipInfo }
+  /** `still` is set for photos; their `info.duration` is the on-screen time the user chose. */
+  | { status: 'ready'; info: ClipInfo; still?: ImageBitmap }
   | { status: 'error'; error: string }
 );
 
@@ -84,6 +85,11 @@ const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, colo
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 /** Large photos are scaled down to this on their long edge — plenty for 4K output, far less memory. */
 const IMAGE_MAX_EDGE = 2048;
+/** Photos used as clips fill the whole frame, so they keep up to 4K detail. */
+const STILL_MAX_EDGE = 3840;
+const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
+const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
+const isVideo = (f: File) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name);
 /** New images start in a free corner (2×2 boxes): top-right, top-left, bottom-right, bottom-left. */
 const CORNERS = [
   [GRID - 2, GRID - 1, 2 * GRID - 2, 2 * GRID - 1],
@@ -99,9 +105,9 @@ const freeOverlay = (overlay: Overlay) => {
 };
 
 /** Decodes an image file, scaled down if it is larger than needed. */
-async function decodeImage(file: File): Promise<ImageBitmap> {
+async function decodeImage(file: File, maxEdge = IMAGE_MAX_EDGE): Promise<ImageBitmap> {
   const full = await createImageBitmap(file);
-  const scale = IMAGE_MAX_EDGE / Math.max(full.width, full.height);
+  const scale = maxEdge / Math.max(full.width, full.height);
   if (scale >= 1) return full;
   const resized = await createImageBitmap(full, {
     resizeWidth: Math.round(full.width * scale),
@@ -419,9 +425,9 @@ export default function App() {
   const stalled = job.state === 'rendering' && (now - job.updatedAt) / 1000 > STALL_SECONDS;
 
   const addFiles = async (files: FileList | null) => {
-    const videos = Array.from(files ?? []).filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name));
-    if (!videos.length) return;
-    const added: Clip[] = videos.map((file) => ({
+    const media = Array.from(files ?? []).filter((f) => isVideo(f) || isPhoto(f));
+    if (!media.length) return;
+    const added: Clip[] = media.map((file) => ({
       id: crypto.randomUUID(),
       file,
       status: 'probing',
@@ -435,11 +441,32 @@ export default function App() {
 
     const { probeClip } = await loadEngine();
     for (const clip of added) {
-      probeClip(clip.file).then(
-        (info) => update(clip.id, { status: 'ready', info }),
+      const probe = isPhoto(clip.file)
+        ? decodeImage(clip.file, STILL_MAX_EDGE).then(
+            (still) => {
+              // If the photo was removed while decoding, release it instead of storing it.
+              if (!clipsRef.current.some((c) => c.id === clip.id)) still.close();
+              const info = { width: still.width, height: still.height, duration: PHOTO_SECONDS.default, fps: NaN };
+              return { info, still };
+            },
+            () => Promise.reject(new Error('This photo could not be read. Use PNG, JPG or WebP.')),
+          )
+        : probeClip(clip.file).then((info) => ({ info }));
+      probe.then(
+        (result) => update(clip.id, { status: 'ready', ...result }),
         (e: Error) => update(clip.id, { status: 'error', error: e.message }),
       );
     }
+  };
+
+  /** Sets how long a photo stays on screen. */
+  const setPhotoSeconds = (clip: Clip & { status: 'ready' }, seconds: number) =>
+    update(clip.id, { info: { ...clip.info, duration: Math.min(PHOTO_SECONDS.max, Math.max(PHOTO_SECONDS.min, seconds || PHOTO_SECONDS.min)) } });
+
+  /** Releases everything a clip holds in memory. */
+  const freeClip = (clip: Clip) => {
+    clip.images.forEach(freeOverlay);
+    if (clip.status === 'ready') clip.still?.close();
   };
 
   const update = (id: string, patch: Partial<Clip>) =>
@@ -534,7 +561,8 @@ export default function App() {
     });
 
   const remove = (id: string) => {
-    clips.find((c) => c.id === id)?.images.forEach(freeOverlay);
+    const clip = clips.find((c) => c.id === id);
+    if (clip) freeClip(clip);
     setClips((prev) => prev.filter((c) => c.id !== id));
   };
 
@@ -552,6 +580,7 @@ export default function App() {
         clips: ready.map((c) => ({
           file: c.file,
           info: c.info,
+          still: c.still,
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
@@ -598,7 +627,7 @@ export default function App() {
   };
 
   const reset = () => {
-    clips.forEach((c) => c.images.forEach(freeOverlay));
+    clips.forEach(freeClip);
     setClips([]);
     setVoiceover(null);
     setMusic(null);
@@ -634,7 +663,7 @@ export default function App() {
       >
         <input
           type="file"
-          accept="video/*"
+          accept="video/*,image/*"
           multiple
           hidden
           disabled={busy}
@@ -643,8 +672,8 @@ export default function App() {
             e.target.value = '';
           }}
         />
-        <strong>Drop videos here or click to browse</strong>
-        <span className="muted">MP4, MOV or WebM · add as many as you need</span>
+        <strong>Drop videos and photos here or click to browse</strong>
+        <span className="muted">Videos: MP4, MOV, WebM · Photos: JPG, PNG, WebP · add as many as you need</span>
       </label>
 
       {clips.length > 0 && (
@@ -681,10 +710,8 @@ export default function App() {
               </div>
             </li>
             {clips.map((clip, i) => {
-              const overflow =
-                perClip && clip.status === 'ready' && clip.voiceover?.status === 'ready'
-                  ? clip.voiceover.buffer.duration - clip.info.duration
-                  : 0;
+              const voiceSeconds = clip.voiceover?.status === 'ready' ? clip.voiceover.buffer.duration : 0;
+              const overflow = perClip && clip.status === 'ready' && voiceSeconds ? voiceSeconds - clip.info.duration : 0;
               return (
                 <li key={clip.id} className={`clip ${clip.status}`}>
                   <div className="clip-row">
@@ -695,8 +722,25 @@ export default function App() {
                     </span>
                     <span className="meta">
                       {clip.status === 'probing' && 'Reading…'}
-                      {clip.status === 'ready' &&
+                      {clip.status === 'ready' && !clip.still &&
                         `${clip.info.width}×${clip.info.height} · ${Math.round(clip.info.fps)} fps · ${formatTime(clip.info.duration)}`}
+                      {clip.status === 'ready' && clip.still && (
+                        <span className="photo-meta">
+                          Photo · {clip.info.width}×{clip.info.height} ·
+                          <input
+                            className="text seconds"
+                            type="number"
+                            aria-label="Seconds on screen"
+                            min={PHOTO_SECONDS.min}
+                            max={PHOTO_SECONDS.max}
+                            step={0.5}
+                            value={clip.info.duration}
+                            disabled={busy}
+                            onChange={(e) => setPhotoSeconds(clip, Number(e.target.value))}
+                          />
+                          s
+                        </span>
+                      )}
                     </span>
                     <span className="actions">
                       <button onClick={() => move(i, -1)} disabled={busy || i === 0} aria-label="Move up">↑</button>
@@ -744,6 +788,18 @@ export default function App() {
                           {overflow > 0.5 && (
                             <p className="hint warn">
                               This voiceover is {formatTime(overflow)} longer than the clip and will be cut at the end.
+                              {clip.status === 'ready' && clip.still && (
+                                <>
+                                  {' '}
+                                  <button
+                                    className="link"
+                                    disabled={busy}
+                                    onClick={() => setPhotoSeconds(clip, Math.ceil(voiceSeconds * 2) / 2)}
+                                  >
+                                    Show the photo for the whole voiceover
+                                  </button>
+                                </>
+                              )}
                             </p>
                           )}
                         </>

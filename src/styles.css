@@ -152,6 +152,8 @@ button.link:disabled { opacity: 0.5; }
 .frame.large { height: 216px; touch-action: none; user-select: none; }
 .frame.large button { border-color: rgba(255, 255, 255, 0.1); }
 .frame-image.other { opacity: 0.35; }
+.photo-meta { display: inline-flex; align-items: center; gap: 6px; }
+input.text.seconds { width: 64px; padding: 4px 6px; font-size: 13px; }
 .custom-size { display: flex; align-items: center; gap: 8px; color: var(--text); }
 .custom-side { display: flex; align-items: center; gap: 8px; }
 .custom-size input { width: 92px; }

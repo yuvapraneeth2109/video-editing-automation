@@ -60,6 +60,8 @@ export type TextPill = {
 export type RenderClip = {
   file: File;
   info: ClipInfo;
+  /** Set for photos: shown still for `info.duration` seconds instead of decoding video. */
+  still?: ImageBitmap;
   motion: Motion;
   /** Transition into the next clip (ignored on the last clip). */
   transition: Transition;
@@ -491,12 +493,48 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   };
 
   /** Opens a clip for sequential frame reading and registers its audio for mixing. */
-  const openClip = async (clip: RenderClip, planned: PlannedClip) => {
-    const input = openInput(clip.file);
+  /** A still photo, letterboxed onto an output-sized canvas once and reused for every frame. */
+  const stillSource = (bitmap: ImageBitmap) => {
+    const still = new OffscreenCanvas(width, height);
+    const g = still.getContext('2d', { alpha: false })!;
+    g.imageSmoothingQuality = 'high';
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, width, height);
+    const s = Math.min(width / bitmap.width, height / bitmap.height);
+    g.drawImage(bitmap, (width - bitmap.width * s) / 2, (height - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
+    return { next: async () => still, close: () => {} };
+  };
+
+  /** A video file: frames decoded in order (letterboxed, rotation applied), its sound fed to the mixer. */
+  const videoFileSource = async (file: File, frames: number, segment: Segment) => {
+    const input = openInput(file);
     const videoTrack = (await input.getPrimaryVideoTrack())!;
     const audioTrack = await input.getPrimaryAudioTrack();
     const origin = await input.getFirstTimestamp();
+    if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
+      segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
+    }
+    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
+    const canvases = sink.canvasesAtTimestamps(
+      (function* () {
+        for (let i = 0; i < frames; i++) yield origin + i / fps;
+      })(),
+    );
+    return {
+      next: async () => {
+        const next = await canvases.next();
+        return !next.done && next.value ? next.value.canvas : null;
+      },
+      close: () => {
+        void canvases.return();
+        segment.reader?.close();
+        input.dispose();
+      },
+    };
+  };
 
+  /** Opens a clip (video or photo) for sequential frame drawing and registers its audio for mixing. */
+  const openClip = async (clip: RenderClip, planned: PlannedClip) => {
     const start = planned.start / fps;
     const end = (planned.start + planned.frames) / fps;
     const fadeOut = planned.outFrames / fps;
@@ -507,18 +545,9 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
       voiceover: clip.voiceover,
     };
-    if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
-      segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
-    }
+    const source = clip.still ? stillSource(clip.still) : await videoFileSource(clip.file, planned.frames, segment);
     activeSegments.add(segment);
 
-    // Letterboxed to the output size; rotation metadata is applied by the sink.
-    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
-    const canvases = sink.canvasesAtTimestamps(
-      (function* () {
-        for (let i = 0; i < planned.frames; i++) yield origin + i / fps;
-      })(),
-    );
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
     const drawImages = clip.images.map(({ bitmap, cells }) => createImageOverlay(ctx, bitmap, cells, width, height));
     const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
@@ -527,8 +556,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     return {
       /** Draws this clip's next frame onto the output canvas, applying transition and zoom. */
       async draw() {
-        const next = await canvases.next();
-        const frame = !next.done && next.value ? next.value.canvas : null;
+        const frame = await source.next();
         const { alpha, offsetX, reveal, scale } = layerAt(planned, clip.motion, k);
 
         ctx.save();
@@ -555,10 +583,8 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
         return k >= planned.frames;
       },
       close() {
-        void canvases.return();
-        segment.reader?.close();
+        source.close();
         activeSegments.delete(segment);
-        input.dispose();
       },
     };
   };
