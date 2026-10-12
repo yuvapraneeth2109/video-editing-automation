@@ -165,7 +165,8 @@ button, .button {
 .primary:disabled { opacity: 0.4; cursor: not-allowed; }
 .secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
 
-.progress-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; }
+.progress-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 4px 12px; }
+.progress-row .stage { grid-column: 1 / -1; font-size: 13px; }
 .progress { height: 10px; background: var(--border); border-radius: 999px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--gradient); transition: width 0.1s linear; }
 

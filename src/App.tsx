@@ -34,7 +34,7 @@ type VoiceMode = 'whole' | 'per-clip';
 
 type Job =
   | { state: 'idle' }
-  | { state: 'rendering'; progress: number; startedAt: number }
+  | { state: 'rendering'; progress: number; stage: string; startedAt: number; updatedAt: number }
   | { state: 'done'; url: string; size: number; seconds: number }
   | { state: 'error'; message: string };
 
@@ -58,6 +58,8 @@ const PILL_POSITIONS: PillPosition[] = [
   'middle-left', 'middle-center', 'middle-right',
   'bottom-left', 'bottom-center', 'bottom-right',
 ];
+/** If progress stops moving for this long, the export is flagged as stuck. */
+const STALL_SECONDS = 45;
 const SUPPORTED = typeof VideoEncoder !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
 
 const formatTime = (s: number) => {
@@ -192,6 +194,16 @@ export default function App() {
   useEffect(() => () => void (job.state === 'done' && URL.revokeObjectURL(job.url)), [job]);
   useEffect(() => void loadEngine(), []);
 
+  // A 1-second clock while exporting keeps the time-left estimate and the stall check current.
+  const [now, setNow] = useState(() => performance.now());
+  useEffect(() => {
+    if (!busy) return;
+    const timer = setInterval(() => setNow(performance.now()), 1000);
+    return () => clearInterval(timer);
+  }, [busy]);
+  const elapsed = job.state === 'rendering' ? (now - job.startedAt) / 1000 : 0;
+  const stalled = job.state === 'rendering' && (now - job.updatedAt) / 1000 > STALL_SECONDS;
+
   const addFiles = async (files: FileList | null) => {
     const videos = Array.from(files ?? []).filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name));
     if (!videos.length) return;
@@ -270,7 +282,7 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
     const startedAt = performance.now();
-    setJob({ state: 'rendering', progress: 0, startedAt });
+    setJob({ state: 'rendering', progress: 0, stage: 'Preparing', startedAt, updatedAt: startedAt });
 
     try {
       const { renderVideo } = await loadEngine();
@@ -296,16 +308,17 @@ export default function App() {
         voiceover: perClip ? undefined : readyBuffer(voiceover),
         music: readyBuffer(music),
         signal: controller.signal,
-        onProgress: (progress) => {
+        onProgress: (progress, stage) => {
           const now = performance.now();
           if (now - lastPaint < 100 && progress < 1) return; // throttle re-renders
           lastPaint = now;
-          setJob({ state: 'rendering', progress, startedAt });
+          setJob({ state: 'rendering', progress, stage, startedAt, updatedAt: now });
         },
       });
       logo.close();
       setJob({ state: 'done', url: URL.createObjectURL(blob), size: blob.size, seconds: (performance.now() - startedAt) / 1000 });
     } catch (e) {
+      console.error('Export failed', e);
       if (controller.signal.aborted) setJob({ state: 'idle' });
       else setJob({ state: 'error', message: e instanceof Error ? e.message : 'Export failed.' });
     } finally {
@@ -424,7 +437,7 @@ export default function App() {
                     <div className="clip-extras">
                       <div className="effects">
                         <label>
-                          Motion
+                          Zoom
                           <select value={clip.motion} disabled={busy} onChange={(e) => update(clip.id, { motion: e.target.value as Motion })}>
                             {MOTIONS.map((m) => (
                               <option key={m} value={m}>{MOTION_LABELS[m]}</option>
@@ -574,7 +587,7 @@ export default function App() {
               </select>
             </label>
             <label>
-              Motion (all clips)
+              Zoom (all clips)
               <select value={common('motion')} disabled={busy} onChange={(e) => setForAll({ motion: e.target.value as Motion })}>
                 {common('motion') === 'mixed' && <option value="mixed" disabled>Mixed</option>}
                 {MOTIONS.map((m) => (
@@ -613,15 +626,22 @@ export default function App() {
                 <div style={{ width: `${job.progress * 100}%` }} />
               </div>
               <span className="muted">
-                {Math.floor(job.progress * 100)}%
-                {job.progress > 0.03 && ` · ~${formatTime(((performance.now() - job.startedAt) / 1000) * (1 / job.progress - 1))} left`}
+                {job.progress < 0.1 ? (job.progress * 100).toFixed(1) : Math.floor(job.progress * 100)}%
+                {job.progress > 0 && elapsed > 3 && ` · ~${formatTime(elapsed * (1 / job.progress - 1))} left`}
               </span>
               <button className="secondary" onClick={() => abortRef.current?.abort()}>Cancel</button>
+              <span className="stage muted">{job.stage}…</span>
             </div>
           ) : (
             <button className="primary" onClick={exportVideo} disabled={!canExport}>
               Export MP4
             </button>
+          )}
+          {stalled && job.state === 'rendering' && (
+            <p className="hint warn">
+              No progress for {STALL_SECONDS} seconds on “{job.stage}”. This file may be too heavy for this browser. Press Cancel,
+              then try “1080p” output and “Up to 30 fps”, or re-export that clip from your phone and add it again.
+            </p>
           )}
           {hasError && <p className="hint error">Remove the files marked in red to export.</p>}
         </section>

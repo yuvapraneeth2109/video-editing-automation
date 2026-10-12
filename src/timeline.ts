@@ -13,7 +13,7 @@ export type PillPosition = `${'top' | 'middle' | 'bottom'}-${'left' | 'center' |
 export type Transition = 'cut' | 'dissolve' | 'fade' | 'slide' | 'wipe';
 
 /** Slow camera move applied across a whole clip. */
-export type Motion = 'none' | 'zoom-in' | 'zoom-out';
+export type Motion = 'none' | 'zoom-in' | 'zoom-out' | 'zoom-in-out';
 
 export const TRANSITION_LABELS: Record<Transition, string> = {
   cut: 'Cut',
@@ -27,6 +27,7 @@ export const MOTION_LABELS: Record<Motion, string> = {
   none: 'None',
   'zoom-in': 'Zoom in',
   'zoom-out': 'Zoom out',
+  'zoom-in-out': 'Zoom in, then out',
 };
 
 /** Transitions where the next clip starts before the current one ends. */

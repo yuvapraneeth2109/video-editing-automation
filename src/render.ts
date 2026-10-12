@@ -71,7 +71,8 @@ export type RenderOptions = {
   /** Plays under the whole video, looping if shorter, with fades at both ends. */
   music?: AudioBuffer;
   signal: AbortSignal;
-  onProgress: (fraction: number) => void;
+  /** `stage` names what is being rendered, e.g. "Clip 2 of 5". */
+  onProgress: (fraction: number, stage: string) => void;
 };
 
 /** MP4, MOV, WebM and MKV cover camera, phone and screen-recorder output. */
@@ -259,6 +260,7 @@ function layerAt(clip: PlannedClip, motion: Motion, k: number): Layer {
   const t = clip.frames > 1 ? k / (clip.frames - 1) : 0;
   if (motion === 'zoom-in') layer.scale = 1 + (MOTION_SCALE - 1) * ease(t);
   if (motion === 'zoom-out') layer.scale = MOTION_SCALE - (MOTION_SCALE - 1) * ease(t);
+  if (motion === 'zoom-in-out') layer.scale = 1 + (MOTION_SCALE - 1) * ease(t < 0.5 ? t * 2 : 2 - t * 2);
 
   if (k < clip.inFrames) {
     const p = ease((k + 0.5) / clip.inFrames);
@@ -295,6 +297,8 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
   const { width, height } = size;
+  let stage = 'Preparing';
+  onProgress(0, stage);
 
   const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: QUALITY_VERY_HIGH });
   if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
@@ -346,7 +350,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     signal.throwIfAborted();
     await videoSource.add(frameIndex / fps, 1 / fps);
     frameIndex++;
-    onProgress(frameIndex / totalFrames);
+    onProgress(frameIndex / totalFrames, stage);
   };
 
   /** A clip's span on the timeline (seconds) and the audio that belongs to it. */
@@ -526,6 +530,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     try {
       for (let f = logoFrames; f < clipsEnd; f++) {
         while (nextClip < clips.length && plan.clips[nextClip].start === f) {
+          stage = `Clip ${nextClip + 1} of ${clips.length}`;
           open.push(await openClip(clips[nextClip], plan.clips[nextClip]));
           nextClip++;
         }
@@ -549,9 +554,12 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
 
   try {
     await output.start();
+    stage = 'Logo intro';
     await renderLogo();
     await renderClips();
+    stage = 'Logo outro';
     await renderLogo();
+    onProgress(1, 'Finishing file');
     await output.finalize();
     return new Blob([output.target.buffer!], { type: 'video/mp4' });
   } catch (error) {
