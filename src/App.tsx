@@ -11,6 +11,12 @@ type Clip = { id: string; file: File } & (
   | { status: 'error'; error: string }
 );
 
+type AudioTrack = { file: File } & (
+  | { status: 'loading' }
+  | { status: 'ready'; buffer: AudioBuffer }
+  | { status: 'error'; error: string }
+);
+
 type Job =
   | { state: 'idle' }
   | { state: 'rendering'; progress: number; startedAt: number }
@@ -25,6 +31,8 @@ const SIZE_PRESETS: Record<string, Size | null> = {
 };
 
 const LOGO_SECONDS = [2, 3, 4, 5];
+/** Clip sound is lowered to this when a voiceover is added, so the voice stays clear. */
+const CLIP_VOLUME_UNDER_VOICE = 30;
 const SUPPORTED = typeof VideoEncoder !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
 
 const formatTime = (s: number) => {
@@ -33,8 +41,76 @@ const formatTime = (s: number) => {
 };
 const formatBytes = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`);
 
+type AudioSlotProps = {
+  label: string;
+  hint: string;
+  track: AudioTrack | null;
+  volume: number;
+  disabled: boolean;
+  onFile: (file: File) => void;
+  onRemove: () => void;
+  onVolume: (volume: number) => void;
+};
+
+function AudioSlot({ label, hint, track, volume, disabled, onFile, onRemove, onVolume }: AudioSlotProps) {
+  return (
+    <div className={`slot${track?.status === 'error' ? ' error' : ''}`}>
+      <div className="slot-head">
+        <strong>{label}</strong>
+        <span className="muted">{hint}</span>
+      </div>
+      {track ? (
+        <div className="slot-file">
+          <span className="name" title={track.file.name}>
+            {track.file.name}
+            {track.status === 'error' && <small>{track.error}</small>}
+          </span>
+          <span className="meta">
+            {track.status === 'loading' && 'Reading…'}
+            {track.status === 'ready' && formatTime(track.buffer.duration)}
+          </span>
+          <span className="actions">
+            <button onClick={onRemove} disabled={disabled} aria-label={`Remove ${label}`}>✕</button>
+          </span>
+        </div>
+      ) : (
+        <label className={`slot-pick${disabled ? ' disabled' : ''}`}>
+          + Add {label.toLowerCase()}
+          <input
+            type="file"
+            accept="audio/*,.mp3,.wav,.m4a,.aac"
+            hidden
+            disabled={disabled}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onFile(file);
+              e.target.value = '';
+            }}
+          />
+        </label>
+      )}
+      {track?.status === 'ready' && <VolumeSlider value={volume} onChange={onVolume} disabled={disabled} />}
+    </div>
+  );
+}
+
+function VolumeSlider({ value, onChange, disabled }: { value: number; onChange: (v: number) => void; disabled: boolean }) {
+  return (
+    <label className="volume">
+      <span>Volume</span>
+      <input type="range" min={0} max={100} step={5} value={value} disabled={disabled} onChange={(e) => onChange(Number(e.target.value))} />
+      <span className="meta">{value}%</span>
+    </label>
+  );
+}
+
 export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
+  const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
+  const [music, setMusic] = useState<AudioTrack | null>(null);
+  const [clipVolume, setClipVolume] = useState(100);
+  const [voiceVolume, setVoiceVolume] = useState(100);
+  const [musicVolume, setMusicVolume] = useState(20);
   const [preset, setPreset] = useState(Object.keys(SIZE_PRESETS)[0]);
   const [logoSeconds, setLogoSeconds] = useState(3);
   const [job, setJob] = useState<Job>({ state: 'idle' });
@@ -43,8 +119,12 @@ export default function App() {
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
-  const canExport = SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length;
-  const totalSeconds = ready.reduce((sum, c) => sum + c.info.duration, 0) + (ready.length ? logoSeconds * 2 : 0);
+  const audioPending = [voiceover, music].some((t) => t && t.status !== 'ready');
+  const canExport = SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending;
+  const clipsSeconds = ready.reduce((sum, c) => sum + c.info.duration, 0);
+  const totalSeconds = clipsSeconds + (ready.length ? logoSeconds * 2 : 0);
+  const voiceOverflow =
+    voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (clipsSeconds + logoSeconds) : 0;
 
   // Warn before closing the tab mid-render; release the output file when it is replaced.
   useEffect(() => {
@@ -69,6 +149,19 @@ export default function App() {
         (info) => update(clip.id, { status: 'ready', info }),
         (e: Error) => update(clip.id, { status: 'error', error: e.message }),
       );
+    }
+  };
+
+  /** Decodes an audio file; ignores the result if the user replaced or removed it meanwhile. */
+  const addAudio = async (file: File, setTrack: typeof setVoiceover) => {
+    setTrack({ file, status: 'loading' });
+    setJob({ state: 'idle' });
+    const settle = (track: AudioTrack) => setTrack((current) => (current?.file === file ? track : current));
+    try {
+      const { loadAudio } = await loadEngine();
+      settle({ file, status: 'ready', buffer: await loadAudio(file) });
+    } catch (e) {
+      settle({ file, status: 'error', error: e instanceof Error ? e.message : 'This audio file could not be read.' });
     }
   };
 
@@ -102,6 +195,9 @@ export default function App() {
         size: SIZE_PRESETS[preset] ?? autoSize(infos[0]),
         fps: autoFps(infos),
         logoSeconds,
+        clipVolume: clipVolume / 100,
+        voiceover: voiceover?.status === 'ready' ? { buffer: voiceover.buffer, volume: voiceVolume / 100 } : undefined,
+        music: music?.status === 'ready' ? { buffer: music.buffer, volume: musicVolume / 100 } : undefined,
         signal: controller.signal,
         onProgress: (progress) => {
           const now = performance.now();
@@ -122,6 +218,8 @@ export default function App() {
 
   const reset = () => {
     setClips([]);
+    setVoiceover(null);
+    setMusic(null);
     setJob({ state: 'idle' });
   };
 
@@ -207,6 +305,45 @@ export default function App() {
             </li>
           </ol>
 
+          <div className="sound">
+            <h3>Sound</h3>
+            <div className="slot">
+              <div className="slot-head">
+                <strong>Clip sound</strong>
+                <span className="muted">The original audio of your videos</span>
+              </div>
+              <VolumeSlider value={clipVolume} onChange={setClipVolume} disabled={busy} />
+            </div>
+            <AudioSlot
+              label="Voiceover"
+              hint="Starts with the first clip"
+              track={voiceover}
+              volume={voiceVolume}
+              disabled={busy}
+              onFile={(file) => {
+                setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
+                void addAudio(file, setVoiceover);
+              }}
+              onRemove={() => setVoiceover(null)}
+              onVolume={setVoiceVolume}
+            />
+            <AudioSlot
+              label="Music"
+              hint="Plays under the whole video, loops and fades out"
+              track={music}
+              volume={musicVolume}
+              disabled={busy}
+              onFile={(file) => void addAudio(file, setMusic)}
+              onRemove={() => setMusic(null)}
+              onVolume={setMusicVolume}
+            />
+            {voiceOverflow > 0.5 && (
+              <p className="hint warn">
+                The voiceover is {formatTime(voiceOverflow)} longer than the video and will be cut at the end.
+              </p>
+            )}
+          </div>
+
           <div className="settings">
             <label>
               Output size
@@ -239,7 +376,7 @@ export default function App() {
               Export MP4
             </button>
           )}
-          {clips.some((c) => c.status === 'error') && (
+          {(clips.some((c) => c.status === 'error') || [voiceover, music].some((t) => t?.status === 'error')) && (
             <p className="hint error">Remove the files marked in red to export.</p>
           )}
         </section>

@@ -21,14 +21,20 @@ import {
 /** Output audio format. 48 kHz stereo is the delivery standard for video. */
 const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
-/** Audio is encoded in step with video every ~second so the muxer never buffers a whole clip. */
+/** Audio is mixed and encoded in step with video every ~second so memory stays flat. */
 const AUDIO_CHUNK_SECONDS = 1;
 const MAX_FPS = 60;
 const MAX_LONG_EDGE = 3840;
+const MUSIC_FADE_IN = 1;
+const MUSIC_FADE_OUT = 2.5;
+const VOICE_FADE_OUT = 0.4;
 
 export type ClipInfo = { width: number; height: number; duration: number; fps: number };
 
 export type Size = { width: number; height: number };
+
+/** A decoded voiceover or music file with its volume (0–1). */
+export type AudioLayer = { buffer: AudioBuffer; volume: number };
 
 export type RenderOptions = {
   clips: { file: File; info: ClipInfo }[];
@@ -36,6 +42,12 @@ export type RenderOptions = {
   size: Size;
   fps: number;
   logoSeconds: number;
+  /** Volume of the clips' own sound (0–1). */
+  clipVolume: number;
+  /** Starts with the first clip and plays once. */
+  voiceover?: AudioLayer;
+  /** Plays under the whole video, looping if shorter, with fades at both ends. */
+  music?: AudioLayer;
   signal: AbortSignal;
   onProgress: (fraction: number) => void;
 };
@@ -68,6 +80,15 @@ export async function probeClip(file: File): Promise<ClipInfo> {
   }
 }
 
+/** Decodes an audio file (MP3, WAV, M4A, AAC…) straight to the output format: 48 kHz stereo. */
+export async function loadAudio(file: File): Promise<AudioBuffer> {
+  try {
+    return await new OfflineAudioContext(CHANNELS, 1, SAMPLE_RATE).decodeAudioData(await file.arrayBuffer());
+  } catch {
+    throw new Error('This audio file could not be read.');
+  }
+}
+
 const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
 /** Matches the first clip's frame size, capped at 4K, with even dimensions as H.264 requires. */
@@ -83,10 +104,10 @@ export function autoFps(clips: ClipInfo[]): number {
 }
 
 /**
- * Turns a clip's decoded audio (any sample rate / channel layout, possibly with gaps)
- * into gap-free 48 kHz stereo windows that line up exactly with the video timeline.
+ * Feeds a clip's decoded audio (any sample rate / channel layout, possibly with gaps)
+ * into a mixing window, aligned exactly to the clip's position on the timeline.
  */
-class AudioWindowReader {
+class ClipAudioReader {
   private pending: WrappedAudioBuffer[] = [];
   private done = false;
 
@@ -95,28 +116,24 @@ class AudioWindowReader {
     private readonly origin: number,
   ) {}
 
-  async read(from: number, frames: number): Promise<AudioBuffer> {
-    const to = from + frames / SAMPLE_RATE;
-
+  /** Schedules the audio between `from` and `to` (seconds from clip start) at the start of `context`. */
+  async schedule(context: BaseAudioContext, destination: AudioNode, from: number, to: number) {
     while (!this.done && (this.pending.length === 0 || this.relStart(this.pending.at(-1)!) < to)) {
       const next = await this.buffers.next();
       if (next.done) this.done = true;
       else this.pending.push(next.value);
     }
 
-    const context = new OfflineAudioContext(CHANNELS, frames, SAMPLE_RATE);
     for (const wrapped of this.pending) {
       const start = this.relStart(wrapped);
       if (start >= to || start + wrapped.duration <= from) continue;
       const node = context.createBufferSource();
       node.buffer = wrapped.buffer;
-      node.connect(context.destination);
-      if (start >= from) node.start(start - from);
-      else node.start(0, from - start);
+      node.connect(destination);
+      node.start(Math.max(0, start - from), Math.max(0, from - start));
     }
 
     this.pending = this.pending.filter((b) => this.relStart(b) + b.duration > to);
-    return context.startRendering();
   }
 
   close() {
@@ -128,14 +145,51 @@ class AudioWindowReader {
   }
 }
 
-const silence = (frames: number) =>
-  new AudioBuffer({ length: frames, numberOfChannels: CHANNELS, sampleRate: SAMPLE_RATE });
+/** Piecewise-linear volume curve as [seconds, gain] points. */
+type Envelope = [number, number][];
+
+const valueAt = (env: Envelope, t: number) => {
+  if (t <= env[0][0]) return env[0][1];
+  for (let i = 1; i < env.length; i++) {
+    const [t1, v1] = env[i];
+    if (t <= t1) {
+      const [t0, v0] = env[i - 1];
+      return t1 === t0 ? v1 : v0 + ((v1 - v0) * (t - t0)) / (t1 - t0);
+    }
+  }
+  return env.at(-1)![1];
+};
+
+/** Applies the part of an envelope that falls inside the window [from, to). */
+const applyEnvelope = (param: AudioParam, env: Envelope, from: number, to: number, scale: number) => {
+  param.setValueAtTime(scale * valueAt(env, from), 0);
+  for (const [t] of env) if (t > from && t < to) param.linearRampToValueAtTime(scale * valueAt(env, t), t - from);
+  param.linearRampToValueAtTime(scale * valueAt(env, to), to - from);
+};
 
 /**
- * Renders: logo intro → every clip in order → logo outro, into one constant-frame-rate MP4.
+ * Stateless soft limiter: transparent below -2 dBFS, smoothly rounds peaks above it so a loud
+ * voice + music + clip sound can never clip. Stateless means no artefacts between mixing windows.
+ * The curve covers input -2..2 (the mix is halved before it, so the curve re-doubles it).
+ */
+const LIMITER_CURVE = (() => {
+  const n = 4097;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = ((i / (n - 1)) * 2 - 1) * 2;
+    const a = Math.abs(x);
+    curve[i] = Math.sign(x) * (a <= 0.8 ? a : 0.8 + 0.2 * Math.tanh((a - 0.8) / 0.2));
+  }
+  return curve;
+})();
+
+/**
+ * Renders: logo intro → every clip in order → logo outro, into one constant-frame-rate MP4,
+ * mixed with an optional voiceover and background music.
  * Decoding and encoding run on the GPU/media engine through WebCodecs; nothing is uploaded.
  */
-export async function renderVideo({ clips, logo, size, fps, logoSeconds, signal, onProgress }: RenderOptions): Promise<Blob> {
+export async function renderVideo(options: RenderOptions): Promise<Blob> {
+  const { clips, logo, size, fps, logoSeconds, clipVolume, voiceover, music, signal, onProgress } = options;
   const { width, height } = size;
 
   const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: QUALITY_VERY_HIGH });
@@ -157,11 +211,27 @@ export async function renderVideo({ clips, logo, size, fps, logoSeconds, signal,
   output.addVideoTrack(videoSource, { frameRate: fps });
   output.addAudioTrack(audioSource);
 
-  // Plan the timeline up front so progress is exact.
+  // Plan the timeline up front so progress is exact and fades land in the right place.
   const logoFrames = Math.max(1, Math.round(logoSeconds * fps));
   const clipFrames = clips.map(({ info }) => Math.max(1, Math.round(info.duration * fps)));
   const totalFrames = logoFrames * 2 + clipFrames.reduce((a, b) => a + b, 0);
   const audioChunkFrames = Math.max(1, Math.round(AUDIO_CHUNK_SECONDS * fps));
+
+  const totalSeconds = totalFrames / fps;
+  const voiceStart = logoFrames / fps;
+  const voiceEnvelope: Envelope = [
+    [0, 1],
+    [Math.max(0, totalSeconds - VOICE_FADE_OUT), 1],
+    [totalSeconds, 0],
+  ];
+  const musicFadeOutStart = Math.max(MUSIC_FADE_IN, totalSeconds - MUSIC_FADE_OUT);
+  const musicEnvelope: Envelope = [
+    [0, 0],
+    [MUSIC_FADE_IN, 1],
+    [musicFadeOutStart, 1],
+    [Math.max(musicFadeOutStart, totalSeconds), 0],
+  ];
+  const useLimiter = Boolean(voiceover || music);
 
   let frameIndex = 0;
   let audioWritten = 0;
@@ -174,18 +244,59 @@ export async function renderVideo({ clips, logo, size, fps, logoSeconds, signal,
     onProgress(frameIndex / totalFrames);
   };
 
-  /** Encodes audio up to the current video position. `read` supplies audio relative to the segment start. */
-  const syncAudio = async (segmentStartSample: number, read?: (from: number, frames: number) => Promise<AudioBuffer>) => {
+  type ClipAudio = { reader: ClipAudioReader; startSample: number };
+
+  /** Mixes clip sound, voiceover and music for one window of the timeline. */
+  const mixWindow = async (fromSample: number, frames: number, clip?: ClipAudio): Promise<AudioBuffer> => {
+    const from = fromSample / SAMPLE_RATE;
+    const to = from + frames / SAMPLE_RATE;
+    const context = new OfflineAudioContext(CHANNELS, frames, SAMPLE_RATE);
+
+    let bus: AudioNode = context.destination;
+    if (useLimiter) {
+      const limiter = context.createWaveShaper();
+      limiter.curve = LIMITER_CURVE;
+      limiter.connect(context.destination);
+      bus = new GainNode(context, { gain: 0.5 });
+      bus.connect(limiter);
+    }
+
+    if (clip) {
+      const gain = new GainNode(context, { gain: clipVolume });
+      gain.connect(bus);
+      const offset = clip.startSample / SAMPLE_RATE;
+      await clip.reader.schedule(context, gain, from - offset, to - offset);
+    }
+
+    if (voiceover && voiceover.volume > 0 && voiceStart < to && voiceStart + voiceover.buffer.duration > from) {
+      const source = new AudioBufferSourceNode(context, { buffer: voiceover.buffer });
+      const gain = new GainNode(context);
+      applyEnvelope(gain.gain, voiceEnvelope, from, to, voiceover.volume);
+      source.connect(gain).connect(bus);
+      source.start(Math.max(0, voiceStart - from), Math.max(0, from - voiceStart));
+    }
+
+    if (music && music.volume > 0) {
+      const source = new AudioBufferSourceNode(context, { buffer: music.buffer, loop: true });
+      const gain = new GainNode(context);
+      applyEnvelope(gain.gain, musicEnvelope, from, to, music.volume);
+      source.connect(gain).connect(bus);
+      source.start(0, from % music.buffer.duration);
+    }
+
+    return context.startRendering();
+  };
+
+  /** Encodes audio up to the current video position. */
+  const syncAudio = async (clip?: ClipAudio) => {
     const target = Math.round((frameIndex * SAMPLE_RATE) / fps);
     const frames = target - audioWritten;
     if (frames <= 0) return;
-    const buffer = read ? await read((audioWritten - segmentStartSample) / SAMPLE_RATE, frames) : silence(frames);
-    await audioSource.add(buffer);
+    await audioSource.add(await mixWindow(audioWritten, frames, clip));
     audioWritten = target;
   };
 
   const renderLogo = async () => {
-    const segmentStart = audioWritten;
     const fadeFrames = Math.max(1, Math.min(Math.round(0.6 * fps), Math.floor(logoFrames / 3)));
     const scale = Math.min((width * 0.5) / logo.width, (height * 0.45) / logo.height);
     const w = logo.width * scale;
@@ -198,26 +309,25 @@ export async function renderVideo({ clips, logo, size, fps, logoSeconds, signal,
       ctx.globalAlpha = Math.min(1, i / fadeFrames, (logoFrames - 1 - i) / fadeFrames);
       ctx.drawImage(logo, (width - w) / 2, (height - h) / 2, w, h);
       await addVideoFrame();
-      if ((i + 1) % audioChunkFrames === 0) await syncAudio(segmentStart);
+      if ((i + 1) % audioChunkFrames === 0) await syncAudio();
     }
     ctx.globalAlpha = 1;
-    await syncAudio(segmentStart);
+    await syncAudio();
   };
 
   const renderClip = async (file: File, frames: number) => {
     const input = openInput(file);
-    let audio: AudioWindowReader | null = null;
+    let clipAudio: ClipAudio | undefined;
     let canvases: AsyncGenerator<{ canvas: HTMLCanvasElement | OffscreenCanvas } | null, void, unknown> | null = null;
     try {
       const videoTrack = (await input.getPrimaryVideoTrack())!;
       const audioTrack = await input.getPrimaryAudioTrack();
       const origin = await input.getFirstTimestamp();
-      const segmentStart = audioWritten;
 
-      if (audioTrack && (await audioTrack.canDecode())) {
-        audio = new AudioWindowReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
+      if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
+        const reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
+        clipAudio = { reader, startSample: audioWritten };
       }
-      const read = audio ? audio.read.bind(audio) : undefined;
 
       // Letterboxed to the output size; rotation metadata is applied by the sink.
       const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
@@ -233,12 +343,12 @@ export async function renderVideo({ clips, logo, size, fps, logoSeconds, signal,
         ctx.fillRect(0, 0, width, height);
         if (!next.done && next.value) ctx.drawImage(next.value.canvas, 0, 0);
         await addVideoFrame();
-        if ((i + 1) % audioChunkFrames === 0) await syncAudio(segmentStart, read);
+        if ((i + 1) % audioChunkFrames === 0) await syncAudio(clipAudio);
       }
-      await syncAudio(segmentStart, read);
+      await syncAudio(clipAudio);
     } finally {
       void canvases?.return();
-      audio?.close();
+      clipAudio?.reader.close();
       input.dispose();
     }
   };

@@ -123,6 +123,35 @@ button, .button {
 .notice.error { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
 .hint.error { margin: 0; color: var(--danger); font-size: 13px; }
 
+.sound { display: grid; gap: 10px; }
+h3 { margin: 4px 0 0; font-size: 15px; }
+.slot {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 14px;
+}
+.slot.error { border-color: var(--danger); }
+.slot-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.slot-file { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; }
+.slot-pick {
+  padding: 10px;
+  text-align: center;
+  font-weight: 600;
+  color: var(--blue);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.slot-pick:hover { border-color: var(--blue); }
+.slot-pick.disabled { opacity: 0.5; pointer-events: none; }
+.volume { display: grid; grid-template-columns: auto 1fr 44px; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
+.volume input { width: 100%; accent-color: var(--blue); }
+.volume .meta { text-align: right; }
+.hint.warn { margin: 0; color: var(--orange); font-size: 13px; }
+
 @media (max-width: 560px) {
   .clip { grid-template-columns: 24px 1fr auto; }
   .clip .meta { grid-column: 2; grid-row: 2; }
