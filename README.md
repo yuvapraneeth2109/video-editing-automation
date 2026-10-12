@@ -1,6 +1,6 @@
 # Roothoot Video Editor
 
-Upload any number of clips, put them in order, optionally add a text pill (caption) to any clip, a voiceover (one for the whole video or one per clip) and background music, and export one MP4 with the Roothoot logo as an animated intro and outro.
+Upload any number of clips, put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion and a text pill (caption) to any clip, a voiceover (one for the whole video or one per clip) and background music, and export one MP4 with the Roothoot logo as an animated intro and outro.
 
 **Live:** deployed on Vercel (free tier) — static site, no backend.
 
@@ -10,7 +10,7 @@ Upload any number of clips, put them in order, optionally add a text pill (capti
 Browser (Chrome / Edge / Safari)
  ├─ Mediabunny demuxes each file (MP4, MOV, WebM, MKV)
  ├─ WebCodecs decodes frames on the GPU media engine
- ├─ Each frame is letterboxed onto one canvas at the output size and frame rate, with optional text pills drawn on top
+ ├─ Each frame is letterboxed onto one canvas at the output size and frame rate, with zoom, transitions and text pills composited on top
  ├─ Clip sound, voiceover and music are mixed (Web Audio) at 48 kHz stereo, in sync with the video
  └─ WebCodecs encodes H.264 + AAC → MP4 (fast-start) → download
 ```
@@ -26,6 +26,9 @@ Browser (Chrome / Edge / Safari)
 | Per-clip voiceover plays from its clip's start and fades out at the clip's end | Each explanation stays with its clip, even after reordering |
 | Whole-video voiceover starts with the first clip; music loops under the whole video with fade in/out | Standard edit layout; music defaults to 20% and clip sound drops to 30% when a voiceover is added, so the voice stays clear |
 | Stateless soft limiter on the mix | Loud layers can never clip, with no artefacts between chunks |
+| Timeline planned on an exact frame grid (`timeline.ts`) shared by UI and engine | Durations shown in the UI match the export; overlapping transitions shorten the video exactly as previewed |
+| Overlapping clips decoded side by side, audio crossfaded with the picture | Dissolve/slide/wipe look and sound seamless |
+| Default output 1080p at up to 30 fps | Phone footage is often 4K60 — 1080p30 is ~8× fewer pixels to encode, so exports are much faster |
 | Media engine lazy-loaded | Page paints instantly; engine loads in the background |
 
 ## Project structure
@@ -34,6 +37,7 @@ Browser (Chrome / Edge / Safari)
 src/
   App.tsx       UI: upload, reorder, settings, progress, preview, download
   render.ts     Media engine: probe clips, render timeline, encode MP4
+  timeline.ts   Pure timeline maths: output size, frame rate, transition layout
   styles.css    Styles (light + dark)
   assets/logo.png
 ```

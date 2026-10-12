@@ -18,24 +18,28 @@ import {
   type WrappedAudioBuffer,
 } from 'mediabunny';
 
+import {
+  planTimeline,
+  type ClipInfo,
+  type Motion,
+  type PillPosition,
+  type PlannedClip,
+  type Size,
+  type Transition,
+} from './timeline';
+
 /** Output audio format. 48 kHz stereo is the delivery standard for video. */
 const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
 /** Audio is mixed and encoded in step with video every ~second so memory stays flat. */
 const AUDIO_CHUNK_SECONDS = 1;
-const MAX_FPS = 60;
-const MAX_LONG_EDGE = 3840;
 const MUSIC_FADE_IN = 1;
 const MUSIC_FADE_OUT = 2.5;
 const VOICE_FADE_OUT = 0.4;
 const CLIP_VOICE_FADE_OUT = 0.3;
 const PILL_FADE = 0.4;
-
-export type ClipInfo = { width: number; height: number; duration: number; fps: number };
-
-export type Size = { width: number; height: number };
-
-export type PillPosition = `${'top' | 'middle' | 'bottom'}-${'left' | 'center' | 'right'}`;
+/** Zoom in/out moves between 100% and this scale over the clip. */
+const MOTION_SCALE = 1.12;
 
 /** A caption shown in a rounded box over one clip. */
 export type TextPill = { text: string; position: PillPosition };
@@ -43,6 +47,9 @@ export type TextPill = { text: string; position: PillPosition };
 export type RenderClip = {
   file: File;
   info: ClipInfo;
+  motion: Motion;
+  /** Transition into the next clip (ignored on the last clip). */
+  transition: Transition;
   /** Plays from the start of this clip and is cut at its end. */
   voiceover?: AudioBuffer;
   pill?: TextPill;
@@ -54,6 +61,7 @@ export type RenderOptions = {
   size: Size;
   fps: number;
   logoSeconds: number;
+  transitionSeconds: number;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
@@ -101,20 +109,6 @@ export async function loadAudio(file: File): Promise<AudioBuffer> {
   } catch {
     throw new Error('This audio file could not be read.');
   }
-}
-
-const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
-
-/** Matches the first clip's frame size, capped at 4K, with even dimensions as H.264 requires. */
-export function autoSize(first: ClipInfo): Size {
-  const scale = Math.min(1, MAX_LONG_EDGE / Math.max(first.width, first.height));
-  return { width: even(first.width * scale), height: even(first.height * scale) };
-}
-
-/** Uses the highest clip frame rate so no source is decimated, capped at 60 fps. */
-export function autoFps(clips: ClipInfo[]): number {
-  const fps = Math.max(...clips.map((c) => c.fps).filter(Number.isFinite));
-  return Math.min(MAX_FPS, fps > 0 ? fps : 30);
 }
 
 /**
@@ -253,13 +247,53 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, { text, position }: 
   };
 };
 
+/** Smooth start and end for transitions and camera moves. */
+const ease = (t: number) => t * t * (3 - 2 * t);
+
+/** How one clip is drawn on a given frame. */
+type Layer = { alpha: number; offsetX: number; reveal: number; scale: number };
+
+/** Works out a clip's opacity, position, wipe and zoom for local frame `k`. */
+function layerAt(clip: PlannedClip, motion: Motion, k: number): Layer {
+  const layer: Layer = { alpha: 1, offsetX: 0, reveal: 1, scale: 1 };
+  const t = clip.frames > 1 ? k / (clip.frames - 1) : 0;
+  if (motion === 'zoom-in') layer.scale = 1 + (MOTION_SCALE - 1) * ease(t);
+  if (motion === 'zoom-out') layer.scale = MOTION_SCALE - (MOTION_SCALE - 1) * ease(t);
+
+  if (k < clip.inFrames) {
+    const p = ease((k + 0.5) / clip.inFrames);
+    if (clip.inType === 'dissolve' || clip.inType === 'fade') layer.alpha = p;
+    if (clip.inType === 'slide') layer.offsetX = 1 - p;
+    if (clip.inType === 'wipe') layer.reveal = p;
+  }
+  const outStart = clip.frames - clip.outFrames;
+  if (k >= outStart) {
+    const p = ease((k - outStart + 0.5) / clip.outFrames);
+    if (clip.outType === 'fade') layer.alpha *= 1 - p;
+    if (clip.outType === 'slide') layer.offsetX = -p;
+    // Dissolve and wipe: the outgoing clip stays put while the next one is drawn over it.
+  }
+  return layer;
+}
+
+/** Builds the clip's audio volume curve: fades match its transitions; cuts stay hard. */
+function clipEnvelope(start: number, end: number, fadeIn: number, fadeOut: number): Envelope {
+  return [
+    [start, fadeIn > 0 ? 0 : 1],
+    [start + fadeIn, 1],
+    [end - fadeOut, 1],
+    [end, fadeOut > 0 ? 0 : 1],
+  ];
+}
+
 /**
- * Renders: logo intro → every clip in order → logo outro, into one constant-frame-rate MP4,
- * with optional text pills, voiceovers (whole-video or per clip) and background music.
+ * Renders: logo intro → every clip in order (with transitions, zoom, text pills) → logo outro,
+ * into one constant-frame-rate MP4, mixed with clip sound, voiceovers and background music.
  * Decoding and encoding run on the GPU/media engine through WebCodecs; nothing is uploaded.
  */
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
-  const { clips, logo, size, fps, logoSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } = options;
+  const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
+    options;
   const { width, height } = size;
 
   const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: QUALITY_VERY_HIGH });
@@ -281,10 +315,16 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   output.addVideoTrack(videoSource, { frameRate: fps });
   output.addAudioTrack(audioSource);
 
-  // Plan the timeline up front so progress is exact and fades land in the right place.
-  const logoFrames = Math.max(1, Math.round(logoSeconds * fps));
-  const clipFrames = clips.map(({ info }) => Math.max(1, Math.round(info.duration * fps)));
-  const totalFrames = logoFrames * 2 + clipFrames.reduce((a, b) => a + b, 0);
+  // Plan every frame up front so progress is exact and transitions and fades land precisely.
+  const plan = planTimeline(
+    clips.map((c) => c.info.duration),
+    clips.map((c) => c.transition),
+    fps,
+    logoSeconds,
+    transitionSeconds,
+  );
+  const { logoFrames, totalFrames } = plan;
+  const clipsEnd = totalFrames - logoFrames;
   const audioChunkFrames = Math.max(1, Math.round(AUDIO_CHUNK_SECONDS * fps));
 
   const totalSeconds = totalFrames / fps;
@@ -309,8 +349,10 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     onProgress(frameIndex / totalFrames);
   };
 
-  /** A clip's place on the timeline and the audio that belongs to it. */
-  type Segment = { start: number; end: number; startSample: number; reader?: ClipAudioReader; voiceover?: AudioBuffer };
+  /** A clip's span on the timeline (seconds) and the audio that belongs to it. */
+  type Segment = { start: number; end: number; envelope: Envelope; fadeOut: number; reader?: ClipAudioReader; voiceover?: AudioBuffer };
+  /** Clips currently on screen — one, or two during a transition. */
+  const activeSegments = new Set<Segment>();
 
   /** Plays `buffer` from `start`, fading out just before `end`, within the window [from, to). */
   const scheduleVoice = (
@@ -337,7 +379,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   };
 
   /** Mixes clip sound, voiceovers and music for one window of the timeline. */
-  const mixWindow = async (fromSample: number, frames: number, segment?: Segment): Promise<AudioBuffer> => {
+  const mixWindow = async (fromSample: number, frames: number): Promise<AudioBuffer> => {
     const from = fromSample / SAMPLE_RATE;
     const to = from + frames / SAMPLE_RATE;
     const context = new OfflineAudioContext(CHANNELS, frames, SAMPLE_RATE);
@@ -351,14 +393,17 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       bus.connect(limiter);
     }
 
-    if (segment?.reader) {
-      const gain = new GainNode(context, { gain: clipVolume });
-      gain.connect(bus);
-      const offset = segment.startSample / SAMPLE_RATE;
-      await segment.reader.schedule(context, gain, from - offset, to - offset);
-    }
-    if (segment?.voiceover) {
-      scheduleVoice(context, bus, segment.voiceover, segment.start, segment.end, CLIP_VOICE_FADE_OUT, from, to);
+    for (const segment of activeSegments) {
+      if (segment.reader) {
+        const gain = new GainNode(context);
+        applyEnvelope(gain.gain, segment.envelope, from, to, clipVolume);
+        gain.connect(bus);
+        await segment.reader.schedule(context, gain, from - segment.start, to - segment.start);
+      }
+      if (segment.voiceover) {
+        const fade = Math.max(CLIP_VOICE_FADE_OUT, segment.fadeOut);
+        scheduleVoice(context, bus, segment.voiceover, segment.start, segment.end, fade, from, to);
+      }
     }
     if (voiceover) {
       scheduleVoice(context, bus, voiceover, voiceStart, totalSeconds, VOICE_FADE_OUT, from, to);
@@ -375,11 +420,11 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   };
 
   /** Encodes audio up to the current video position. */
-  const syncAudio = async (segment?: Segment) => {
+  const syncAudio = async () => {
     const target = Math.round((frameIndex * SAMPLE_RATE) / fps);
     const frames = target - audioWritten;
     if (frames <= 0) return;
-    await audioSource.add(await mixWindow(audioWritten, frames, segment));
+    await audioSource.add(await mixWindow(audioWritten, frames));
     audioWritten = target;
   };
 
@@ -402,56 +447,110 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     await syncAudio();
   };
 
-  const renderClip = async ({ file, voiceover: clipVoice, pill }: RenderClip, frames: number) => {
-    const input = openInput(file);
-    let canvases: AsyncGenerator<{ canvas: HTMLCanvasElement | OffscreenCanvas } | null, void, unknown> | null = null;
+  /** Opens a clip for sequential frame reading and registers its audio for mixing. */
+  const openClip = async (clip: RenderClip, planned: PlannedClip) => {
+    const input = openInput(clip.file);
+    const videoTrack = (await input.getPrimaryVideoTrack())!;
+    const audioTrack = await input.getPrimaryAudioTrack();
+    const origin = await input.getFirstTimestamp();
+
+    const start = planned.start / fps;
+    const end = (planned.start + planned.frames) / fps;
+    const fadeOut = planned.outFrames / fps;
     const segment: Segment = {
-      start: frameIndex / fps,
-      end: (frameIndex + frames) / fps,
-      startSample: audioWritten,
-      voiceover: clipVoice,
+      start,
+      end,
+      fadeOut,
+      envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
+      voiceover: clip.voiceover,
     };
-    try {
-      const videoTrack = (await input.getPrimaryVideoTrack())!;
-      const audioTrack = await input.getPrimaryAudioTrack();
-      const origin = await input.getFirstTimestamp();
+    if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
+      segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
+    }
+    activeSegments.add(segment);
 
-      if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
-        segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
-      }
+    // Letterboxed to the output size; rotation metadata is applied by the sink.
+    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
+    const canvases = sink.canvasesAtTimestamps(
+      (function* () {
+        for (let i = 0; i < planned.frames; i++) yield origin + i / fps;
+      })(),
+    );
+    const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
+    const pillFadeFrames = Math.max(1, Math.min(Math.round(PILL_FADE * fps), Math.floor(planned.frames / 3)));
+    let k = 0;
 
-      const drawPill = pill?.text.trim() ? createPill(ctx, pill, width, height) : null;
-      const pillFadeFrames = Math.max(1, Math.min(Math.round(PILL_FADE * fps), Math.floor(frames / 3)));
-
-      // Letterboxed to the output size; rotation metadata is applied by the sink.
-      const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
-      canvases = sink.canvasesAtTimestamps(
-        (function* () {
-          for (let i = 0; i < frames; i++) yield origin + i / fps;
-        })(),
-      );
-
-      for (let i = 0; i < frames; i++) {
+    return {
+      /** Draws this clip's next frame onto the output canvas, applying transition and zoom. */
+      async draw() {
         const next = await canvases.next();
+        const frame = !next.done && next.value ? next.value.canvas : null;
+        const { alpha, offsetX, reveal, scale } = layerAt(planned, clip.motion, k);
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(offsetX * width, 0);
+        if (reveal < 1) {
+          ctx.beginPath();
+          ctx.rect(0, 0, reveal * width, height);
+          ctx.clip();
+        }
+        if (frame) {
+          const w = width * scale;
+          const h = height * scale;
+          ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
+        }
+        drawPill?.(alpha * Math.min(1, k / pillFadeFrames, (planned.frames - 1 - k) / pillFadeFrames));
+        ctx.restore();
+        k++;
+      },
+      /** True once every frame of this clip has been drawn. */
+      get finished() {
+        return k >= planned.frames;
+      },
+      close() {
+        void canvases.return();
+        segment.reader?.close();
+        activeSegments.delete(segment);
+        input.dispose();
+      },
+    };
+  };
+
+  type OpenClip = Awaited<ReturnType<typeof openClip>>;
+
+  /** Walks the clip section frame by frame; clips overlap during dissolve, slide and wipe. */
+  const renderClips = async () => {
+    const open: OpenClip[] = [];
+    let nextClip = 0;
+    try {
+      for (let f = logoFrames; f < clipsEnd; f++) {
+        while (nextClip < clips.length && plan.clips[nextClip].start === f) {
+          open.push(await openClip(clips[nextClip], plan.clips[nextClip]));
+          nextClip++;
+        }
         ctx.fillStyle = '#000000';
         ctx.fillRect(0, 0, width, height);
-        if (!next.done && next.value) ctx.drawImage(next.value.canvas, 0, 0);
-        drawPill?.(Math.min(1, i / pillFadeFrames, (frames - 1 - i) / pillFadeFrames));
+        for (const clip of open) await clip.draw(); // older clip first, the incoming one on top
         await addVideoFrame();
-        if ((i + 1) % audioChunkFrames === 0) await syncAudio(segment);
+
+        const finished = open.filter((c) => c.finished);
+        if (finished.length || (f + 1) % audioChunkFrames === 0) await syncAudio();
+        for (const clip of finished) {
+          clip.close();
+          open.splice(open.indexOf(clip), 1);
+        }
       }
-      await syncAudio(segment);
+      await syncAudio();
     } finally {
-      void canvases?.return();
-      segment.reader?.close();
-      input.dispose();
+      open.forEach((c) => c.close());
     }
   };
 
   try {
     await output.start();
     await renderLogo();
-    for (let i = 0; i < clips.length; i++) await renderClip(clips[i], clipFrames[i]);
+    await renderClips();
     await renderLogo();
     await output.finalize();
     return new Blob([output.target.buffer!], { type: 'video/mp4' });

@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import logoUrl from './assets/logo.png';
-import type { ClipInfo, PillPosition, Size } from './render';
+import {
+  MOTION_LABELS,
+  TRANSITION_LABELS,
+  autoFps,
+  autoSize,
+  planTimeline,
+  type ClipInfo,
+  type Motion,
+  type PillPosition,
+  type Size,
+  type Transition,
+} from './timeline';
 
 // The media engine is loaded on demand so the page itself paints instantly.
 const loadEngine = () => import('./render');
@@ -13,7 +24,7 @@ type AudioTrack = { file: File } & (
 
 type Pill = { enabled: boolean; text: string; position: PillPosition };
 
-type Clip = { id: string; file: File; voiceover: AudioTrack | null; pill: Pill } & (
+type Clip = { id: string; file: File; voiceover: AudioTrack | null; pill: Pill; motion: Motion; transition: Transition } & (
   | { status: 'probing' }
   | { status: 'ready'; info: ClipInfo }
   | { status: 'error'; error: string }
@@ -27,12 +38,16 @@ type Job =
   | { state: 'done'; url: string; size: number; seconds: number }
   | { state: 'error'; message: string };
 
-const SIZE_PRESETS: Record<string, Size | null> = {
-  'Match first clip': null,
-  '1080p landscape (1920×1080)': { width: 1920, height: 1080 },
-  '1080p portrait (1080×1920)': { width: 1080, height: 1920 },
-  '4K landscape (3840×2160)': { width: 3840, height: 2160 },
+const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
+  '1080p, shape of first clip (recommended)': (first) => autoSize(first, 1080),
+  'Original size, up to 4K (slower)': (first) => autoSize(first),
+  '1080p landscape (1920×1080)': () => ({ width: 1920, height: 1080 }),
+  '1080p portrait (1080×1920)': () => ({ width: 1080, height: 1920 }),
+  '4K landscape (slowest)': () => ({ width: 3840, height: 2160 }),
 };
+const TRANSITION_SECONDS = [0.5, 0.75, 1, 1.5];
+const TRANSITIONS = Object.keys(TRANSITION_LABELS) as Transition[];
+const MOTIONS = Object.keys(MOTION_LABELS) as Motion[];
 
 const LOGO_SECONDS = [2, 3, 4, 5];
 /** Clip sound is lowered to this when a voiceover is added, so the voice stays clear. */
@@ -141,6 +156,9 @@ export default function App() {
   const [musicVolume, setMusicVolume] = useState(20);
   const [preset, setPreset] = useState(Object.keys(SIZE_PRESETS)[0]);
   const [logoSeconds, setLogoSeconds] = useState(3);
+  const [fastFps, setFastFps] = useState(true);
+  const [transitionSeconds, setTransitionSeconds] = useState(0.75);
+  const [defaults, setDefaults] = useState<{ transition: Transition; motion: Motion }>({ transition: 'dissolve', motion: 'none' });
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -152,13 +170,17 @@ export default function App() {
   const audioPending = activeTracks.some((t) => t && t.status !== 'ready');
   const hasError = clips.some((c) => c.status === 'error') || activeTracks.some((t) => t?.status === 'error');
   const canExport = SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending;
-  const clipsSeconds = ready.reduce((sum, c) => sum + c.info.duration, 0);
-  const totalSeconds = clipsSeconds + (ready.length ? logoSeconds * 2 : 0);
+  const fps = ready.length ? autoFps(ready.map((c) => c.info), fastFps) : 30;
+  const plan = planTimeline(ready.map((c) => c.info.duration), ready.map((c) => c.transition), fps, logoSeconds, transitionSeconds);
+  const totalSeconds = ready.length ? plan.totalFrames / fps : 0;
   const voiceOverflow =
-    !perClip && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (clipsSeconds + logoSeconds) : 0;
+    !perClip && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (totalSeconds - logoSeconds) : 0;
   const hasAnyVoice = perClip ? clips.some((c) => c.voiceover?.status === 'ready') : voiceover?.status === 'ready';
-  const outputSize = SIZE_PRESETS[preset] ?? (ready[0] ? { width: ready[0].info.width, height: ready[0].info.height } : null);
+  const outputSize = ready[0] ? SIZE_PRESETS[preset](ready[0].info) : null;
   const aspect = outputSize ? outputSize.width / outputSize.height : 16 / 9;
+  /** The value shared by every clip, or 'mixed' when clips differ. */
+  const common = <K extends 'transition' | 'motion'>(key: K) =>
+    clips.length && clips.some((c) => c[key] !== clips[0][key]) ? 'mixed' : (clips[0]?.[key] ?? defaults[key]);
 
   // Warn before closing the tab mid-render; release the output file when it is replaced.
   useEffect(() => {
@@ -179,6 +201,7 @@ export default function App() {
       status: 'probing',
       voiceover: null,
       pill: { enabled: false, text: '', position: 'bottom-center' },
+      ...defaults,
     }));
     setClips((prev) => [...prev, ...added]);
     setJob({ state: 'idle' });
@@ -196,6 +219,12 @@ export default function App() {
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
 
   const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
+
+  /** Applies a transition or motion to every clip and to clips added later. */
+  const setForAll = (patch: Partial<{ transition: Transition; motion: Motion }>) => {
+    setDefaults((d) => ({ ...d, ...patch }));
+    setClips((prev) => prev.map((c) => ({ ...c, ...patch })));
+  };
 
   /** Decodes an audio file; `settle` ignores the result if the user replaced or removed it meanwhile. */
   const decodeAudio = async (file: File, settle: (track: AudioTrack) => void) => {
@@ -244,21 +273,23 @@ export default function App() {
     setJob({ state: 'rendering', progress: 0, startedAt });
 
     try {
-      const { autoFps, autoSize, renderVideo } = await loadEngine();
+      const { renderVideo } = await loadEngine();
       const logo = await createImageBitmap(await (await fetch(logoUrl)).blob());
-      const infos = ready.map((c) => c.info);
       let lastPaint = 0;
       const blob = await renderVideo({
         clips: ready.map((c) => ({
           file: c.file,
           info: c.info,
+          motion: c.motion,
+          transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
           pill: c.pill.enabled && c.pill.text.trim() ? { text: c.pill.text, position: c.pill.position } : undefined,
         })),
         logo,
-        size: SIZE_PRESETS[preset] ?? autoSize(infos[0]),
-        fps: autoFps(infos),
+        size: SIZE_PRESETS[preset](ready[0].info),
+        fps,
         logoSeconds,
+        transitionSeconds,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
@@ -391,6 +422,31 @@ export default function App() {
 
                   {clip.status === 'ready' && (
                     <div className="clip-extras">
+                      <div className="effects">
+                        <label>
+                          Motion
+                          <select value={clip.motion} disabled={busy} onChange={(e) => update(clip.id, { motion: e.target.value as Motion })}>
+                            {MOTIONS.map((m) => (
+                              <option key={m} value={m}>{MOTION_LABELS[m]}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {i < clips.length - 1 && (
+                          <label>
+                            Transition to next clip
+                            <select
+                              value={clip.transition}
+                              disabled={busy}
+                              onChange={(e) => update(clip.id, { transition: e.target.value as Transition })}
+                            >
+                              {TRANSITIONS.map((t) => (
+                                <option key={t} value={t}>{TRANSITION_LABELS[t]}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                      </div>
+
                       {perClip && (
                         <>
                           <AudioPicker
@@ -497,10 +553,32 @@ export default function App() {
 
           <div className="settings">
             <label>
-              Output size
-              <select value={preset} onChange={(e) => setPreset(e.target.value)} disabled={busy}>
-                {Object.keys(SIZE_PRESETS).map((p) => (
-                  <option key={p}>{p}</option>
+              Transitions (all clips)
+              <select
+                value={common('transition')}
+                disabled={busy}
+                onChange={(e) => setForAll({ transition: e.target.value as Transition })}
+              >
+                {common('transition') === 'mixed' && <option value="mixed" disabled>Mixed</option>}
+                {TRANSITIONS.map((t) => (
+                  <option key={t} value={t}>{TRANSITION_LABELS[t]}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Transition length
+              <select value={transitionSeconds} disabled={busy} onChange={(e) => setTransitionSeconds(Number(e.target.value))}>
+                {TRANSITION_SECONDS.map((s) => (
+                  <option key={s} value={s}>{s} seconds</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Motion (all clips)
+              <select value={common('motion')} disabled={busy} onChange={(e) => setForAll({ motion: e.target.value as Motion })}>
+                {common('motion') === 'mixed' && <option value="mixed" disabled>Mixed</option>}
+                {MOTIONS.map((m) => (
+                  <option key={m} value={m}>{MOTION_LABELS[m]}</option>
                 ))}
               </select>
             </label>
@@ -512,6 +590,21 @@ export default function App() {
                 ))}
               </select>
             </label>
+            <label>
+              Output size
+              <select value={preset} onChange={(e) => setPreset(e.target.value)} disabled={busy}>
+                {Object.keys(SIZE_PRESETS).map((p) => (
+                  <option key={p}>{p}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Frame rate
+              <select value={fastFps ? 'fast' : 'smooth'} onChange={(e) => setFastFps(e.target.value === 'fast')} disabled={busy}>
+                <option value="fast">Up to 30 fps (faster export)</option>
+                <option value="smooth">Match clips, up to 60 fps (smoother)</option>
+              </select>
+            </label>
           </div>
 
           {job.state === 'rendering' ? (
@@ -519,7 +612,10 @@ export default function App() {
               <div className="progress" role="progressbar" aria-valuenow={Math.round(job.progress * 100)}>
                 <div style={{ width: `${job.progress * 100}%` }} />
               </div>
-              <span className="muted">{Math.floor(job.progress * 100)}%</span>
+              <span className="muted">
+                {Math.floor(job.progress * 100)}%
+                {job.progress > 0.03 && ` · ~${formatTime(((performance.now() - job.startedAt) / 1000) * (1 / job.progress - 1))} left`}
+              </span>
               <button className="secondary" onClick={() => abortRef.current?.abort()}>Cancel</button>
             </div>
           ) : (
