@@ -19,6 +19,8 @@ import {
 } from 'mediabunny';
 
 import {
+  GRID,
+  cellBounds,
   planTimeline,
   type ClipInfo,
   type Motion,
@@ -37,7 +39,8 @@ const MUSIC_FADE_IN = 1;
 const MUSIC_FADE_OUT = 2.5;
 const VOICE_FADE_OUT = 0.4;
 const CLIP_VOICE_FADE_OUT = 0.3;
-const PILL_FADE = 0.4;
+/** Text pills and images fade in and out over this many seconds. */
+const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
 
@@ -60,6 +63,8 @@ export type RenderClip = {
   /** Plays from the start of this clip and is cut at its end. */
   voiceover?: AudioBuffer;
   pill?: TextPill;
+  /** An image shown over this clip, fitted inside the grid cells it covers. */
+  image?: { bitmap: ImageBitmap; cells: number[] };
 };
 
 export type RenderOptions = {
@@ -252,6 +257,27 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, widt
     ctx.textAlign = align;
     ctx.textBaseline = 'middle';
     lines.forEach((line, i) => ctx.fillText(line, textX, y + padY + lineHeight * (i + 0.5)));
+    ctx.restore();
+  };
+};
+
+/** Fits an image (keeping its proportions) inside the grid cells it covers; returns a draw-at-opacity function. */
+const createImageOverlay = (ctx: OffscreenCanvasRenderingContext2D, bitmap: ImageBitmap, cells: number[], width: number, height: number) => {
+  const { col, row, cols, rows } = cellBounds(cells);
+  const inset = Math.min(width, height) * 0.02;
+  const areaW = (cols * width) / GRID - inset * 2;
+  const areaH = (rows * height) / GRID - inset * 2;
+  const scale = Math.min(areaW / bitmap.width, areaH / bitmap.height);
+  const w = bitmap.width * scale;
+  const h = bitmap.height * scale;
+  const x = (col * width) / GRID + inset + (areaW - w) / 2;
+  const y = (row * height) / GRID + inset + (areaH - h) / 2;
+
+  return (alpha: number) => {
+    if (alpha <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(bitmap, x, y, w, h);
     ctx.restore();
   };
 };
@@ -489,7 +515,8 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       })(),
     );
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
-    const pillFadeFrames = Math.max(1, Math.min(Math.round(PILL_FADE * fps), Math.floor(planned.frames / 3)));
+    const drawImage = clip.image?.cells.length ? createImageOverlay(ctx, clip.image.bitmap, clip.image.cells, width, height) : null;
+    const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
     let k = 0;
 
     return {
@@ -512,7 +539,9 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
           const h = height * scale;
           ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
         }
-        drawPill?.(alpha * Math.min(1, k / pillFadeFrames, (planned.frames - 1 - k) / pillFadeFrames));
+        const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
+        drawImage?.(overlayAlpha);
+        drawPill?.(overlayAlpha);
         ctx.restore();
         k++;
       },

@@ -44,6 +44,16 @@ export const PILL_FONTS = {
 
 export type PillFont = keyof typeof PILL_FONTS;
 
+/** Overlays are placed on a 3×3 grid; cells are numbered 0–8, left to right, top to bottom. */
+export const GRID = 3;
+
+/** The rectangle (in whole cells) that covers every selected cell. */
+export function cellBounds(cells: number[]) {
+  const cols = cells.map((c) => c % GRID);
+  const rows = cells.map((c) => Math.floor(c / GRID));
+  return { col: Math.min(...cols), row: Math.min(...rows), cols: Math.max(...cols) - Math.min(...cols) + 1, rows: Math.max(...rows) - Math.min(...rows) + 1 };
+}
+
 /** Transitions where the next clip starts before the current one ends. */
 const OVERLAPS: ReadonlySet<Transition> = new Set(['dissolve', 'slide', 'wipe']);
 

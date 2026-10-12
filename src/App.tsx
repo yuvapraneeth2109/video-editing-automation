@@ -8,7 +8,9 @@ import {
   planTimeline,
   type ClipInfo,
   type Motion,
+  GRID,
   PILL_FONTS,
+  cellBounds,
   type PillFont,
   type PillPosition,
   type Size,
@@ -27,7 +29,22 @@ type AudioTrack = { file: File } & (
 type PillStyle = { background: string; opacity: number; color: string; font: PillFont };
 type Pill = { enabled: boolean; text: string; position: PillPosition } & PillStyle;
 
-type Clip = { id: string; file: File; voiceover: AudioTrack | null; pill: Pill; motion: Motion; transition: Transition } & (
+/** An image overlay: decoded once when chosen; `url` previews it in the placement grid. */
+type Overlay = { file: File; url: string; cells: number[] } & (
+  | { status: 'loading' }
+  | { status: 'ready'; bitmap: ImageBitmap }
+  | { status: 'error'; error: string }
+);
+
+type Clip = {
+  id: string;
+  file: File;
+  voiceover: AudioTrack | null;
+  pill: Pill;
+  image: { enabled: boolean; overlay: Overlay | null };
+  motion: Motion;
+  transition: Transition;
+} & (
   | { status: 'probing' }
   | { status: 'ready'; info: ClipInfo }
   | { status: 'error'; error: string }
@@ -54,6 +71,31 @@ const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
 };
 const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
+/** Large photos are scaled down to this on their long edge — plenty for 4K output, far less memory. */
+const IMAGE_MAX_EDGE = 2048;
+/** New images start in the top-right box. */
+const DEFAULT_IMAGE_CELLS = [2];
+
+/** Releases an overlay's preview URL and decoded pixels. */
+const freeOverlay = (overlay: Overlay | null | undefined) => {
+  if (!overlay) return;
+  URL.revokeObjectURL(overlay.url);
+  if (overlay.status === 'ready') overlay.bitmap.close();
+};
+
+/** Decodes an image file, scaled down if it is larger than needed. */
+async function decodeImage(file: File): Promise<ImageBitmap> {
+  const full = await createImageBitmap(file);
+  const scale = IMAGE_MAX_EDGE / Math.max(full.width, full.height);
+  if (scale >= 1) return full;
+  const resized = await createImageBitmap(full, {
+    resizeWidth: Math.round(full.width * scale),
+    resizeHeight: Math.round(full.height * scale),
+    resizeQuality: 'high',
+  });
+  full.close();
+  return resized;
+}
 
 /** '#rrggbb' + 0–100 opacity → CSS rgba(). */
 const toRgba = (hex: string, opacity: number) => {
@@ -197,6 +239,44 @@ function PillStyleEditor({ pill, disabled, onChange, onApplyAll }: { pill: Pill;
   );
 }
 
+/** A miniature frame: click boxes to choose where the image goes; it fills the rectangle around them. */
+function ImagePlacement({ overlay, aspect, disabled, onChange }: { overlay: Overlay; aspect: number; disabled: boolean; onChange: (cells: number[]) => void }) {
+  const area = overlay.cells.length ? cellBounds(overlay.cells) : null;
+  const toggle = (cell: number) =>
+    onChange(overlay.cells.includes(cell) ? overlay.cells.filter((c) => c !== cell) : [...overlay.cells, cell]);
+  return (
+    <div className="position">
+      <span className="muted">Placement and size — click the boxes the image should cover</span>
+      <div className="frame" style={{ aspectRatio: aspect }} aria-label="Image placement">
+        {Array.from({ length: GRID * GRID }, (_, cell) => (
+          <button
+            key={cell}
+            aria-pressed={overlay.cells.includes(cell)}
+            aria-label={`Box ${cell + 1}`}
+            className={overlay.cells.includes(cell) ? 'selected' : ''}
+            disabled={disabled}
+            onClick={() => toggle(cell)}
+          />
+        ))}
+        {area && (
+          <img
+            className="frame-image"
+            src={overlay.url}
+            alt=""
+            style={{
+              left: `${(area.col / GRID) * 100}%`,
+              top: `${(area.row / GRID) * 100}%`,
+              width: `${(area.cols / GRID) * 100}%`,
+              height: `${(area.rows / GRID) * 100}%`,
+            }}
+          />
+        )}
+      </div>
+      {!area && <p className="hint warn">Select at least one box, or the image won't be shown.</p>}
+    </div>
+  );
+}
+
 /** A miniature frame: click a cell to place the pill there. */
 function PositionPicker({ value, aspect, disabled, onChange }: { value: PillPosition; aspect: number; disabled: boolean; onChange: (p: PillPosition) => void }) {
   return (
@@ -244,8 +324,11 @@ export default function App() {
   const perClip = voiceMode === 'per-clip';
   const activeTracks = [music, ...(perClip ? clips.map((c) => c.voiceover) : [voiceover])];
   const audioPending = activeTracks.some((t) => t && t.status !== 'ready');
-  const hasError = clips.some((c) => c.status === 'error') || activeTracks.some((t) => t?.status === 'error');
-  const canExport = SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending;
+  const overlays = clips.filter((c) => c.image.enabled).map((c) => c.image.overlay);
+  const hasError =
+    clips.some((c) => c.status === 'error') || [...activeTracks, ...overlays].some((t) => t?.status === 'error');
+  const canExport =
+    SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending && !overlays.some((o) => o?.status === 'loading');
   const fps = ready.length ? autoFps(ready.map((c) => c.info), fastFps) : 30;
   const plan = planTimeline(ready.map((c) => c.info.duration), ready.map((c) => c.transition), fps, logoSeconds, transitionSeconds);
   const totalSeconds = ready.length ? plan.totalFrames / fps : 0;
@@ -286,6 +369,7 @@ export default function App() {
       file,
       status: 'probing',
       voiceover: null,
+      image: { enabled: false, overlay: null },
       pill: { enabled: false, text: '', position: 'bottom-center', ...pillDefaults },
       ...defaults,
     }));
@@ -305,6 +389,31 @@ export default function App() {
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
 
   const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
+
+  /** Patches a clip's image overlay; frees the old image when it is replaced or removed. */
+  const updateImage = (clip: Clip, patch: Partial<Clip['image']>) => {
+    const old = clip.image.overlay;
+    if ('overlay' in patch && patch.overlay?.file !== old?.file) freeOverlay(old);
+    update(clip.id, { image: { ...clip.image, ...patch } });
+  };
+
+  const addImage = async (clip: Clip, file: File) => {
+    const overlay: Overlay = { file, url: URL.createObjectURL(file), cells: clip.image.overlay?.cells ?? DEFAULT_IMAGE_CELLS, status: 'loading' };
+    updateImage(clip, { overlay });
+    const settle = (patch: Partial<Overlay>) =>
+      setClips((prev) =>
+        prev.map((c) =>
+          c.id === clip.id && c.image.overlay?.file === file
+            ? { ...c, image: { ...c.image, overlay: { ...c.image.overlay, ...patch } as Overlay } }
+            : c,
+        ),
+      );
+    try {
+      settle({ status: 'ready', bitmap: await decodeImage(file) });
+    } catch {
+      settle({ status: 'error', error: 'This image could not be read.' });
+    }
+  };
 
   /** Copies one pill's colours and font to every clip's pill and to clips added later. */
   const applyPillStyleToAll = ({ background, opacity, color, font }: PillStyle) => {
@@ -357,7 +466,10 @@ export default function App() {
       return next;
     });
 
-  const remove = (id: string) => setClips((prev) => prev.filter((c) => c.id !== id));
+  const remove = (id: string) => {
+    freeOverlay(clips.find((c) => c.id === id)?.image.overlay);
+    setClips((prev) => prev.filter((c) => c.id !== id));
+  };
 
   const exportVideo = async () => {
     const controller = new AbortController();
@@ -376,6 +488,10 @@ export default function App() {
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
+          image:
+            c.image.enabled && c.image.overlay?.status === 'ready' && c.image.overlay.cells.length
+              ? { bitmap: c.image.overlay.bitmap, cells: c.image.overlay.cells }
+              : undefined,
           pill:
             c.pill.enabled && c.pill.text.trim()
               ? {
@@ -417,6 +533,7 @@ export default function App() {
   };
 
   const reset = () => {
+    clips.forEach((c) => freeOverlay(c.image.overlay));
     setClips([]);
     setVoiceover(null);
     setMusic(null);
@@ -605,6 +722,58 @@ export default function App() {
                           aspect={aspect}
                           disabled={busy}
                           onChange={(position) => updatePill(clip, { position })}
+                        />
+                      )}
+
+                      <label className="toggle">
+                        <input
+                          type="checkbox"
+                          checked={clip.image.enabled}
+                          disabled={busy}
+                          onChange={(e) => updateImage(clip, { enabled: e.target.checked })}
+                        />
+                        Add an image over this clip
+                      </label>
+
+                      {clip.image.enabled &&
+                        (clip.image.overlay ? (
+                          <div className={`slot-file${clip.image.overlay.status === 'error' ? ' error' : ''}`}>
+                            <span className="name" title={clip.image.overlay.file.name}>
+                              {clip.image.overlay.file.name}
+                              {clip.image.overlay.status === 'error' && <small>{clip.image.overlay.error}</small>}
+                            </span>
+                            <span className="meta">
+                              {clip.image.overlay.status === 'loading' && 'Reading…'}
+                              {clip.image.overlay.status === 'ready' &&
+                                `${clip.image.overlay.bitmap.width}×${clip.image.overlay.bitmap.height}`}
+                            </span>
+                            <span className="actions">
+                              <button onClick={() => updateImage(clip, { overlay: null })} disabled={busy} aria-label="Remove image">✕</button>
+                            </span>
+                          </div>
+                        ) : (
+                          <label className={`slot-pick${busy ? ' disabled' : ''}`}>
+                            + Choose image (PNG, JPG, WebP)
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp,image/gif"
+                              hidden
+                              disabled={busy}
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) void addImage(clip, file);
+                                e.target.value = '';
+                              }}
+                            />
+                          </label>
+                        ))}
+
+                      {clip.image.enabled && clip.image.overlay?.status === 'ready' && (
+                        <ImagePlacement
+                          overlay={clip.image.overlay}
+                          aspect={aspect}
+                          disabled={busy}
+                          onChange={(cells) => updateImage(clip, { overlay: { ...clip.image.overlay!, cells } })}
                         />
                       )}
                     </div>
