@@ -1,0 +1,130 @@
+:root {
+  --orange: #ee7a3b;
+  --blue: #4a8fd0;
+  --gradient: linear-gradient(90deg, var(--orange), var(--blue));
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #16181d;
+  --muted: #6b7280;
+  --border: #e3e6eb;
+  --danger: #d93f3f;
+  --radius: 14px;
+  color-scheme: light dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #181b21;
+    --text: #eceef2;
+    --muted: #9aa1ad;
+    --border: #2a2f38;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.page {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 40px 16px 64px;
+  display: grid;
+  gap: 20px;
+}
+
+.header { display: flex; align-items: center; gap: 18px; }
+.brand { width: 72px; height: auto; flex-shrink: 0; }
+h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+h2 { margin: 0; font-size: 17px; }
+.muted { color: var(--muted); font-size: 14px; margin: 0; }
+
+.dropzone {
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  padding: 44px 16px;
+  text-align: center;
+  background: var(--surface);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone:hover, .dropzone.active { border-color: var(--blue); }
+.dropzone.disabled { opacity: 0.5; pointer-events: none; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+}
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+
+.clips { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.clip {
+  display: grid;
+  grid-template-columns: 28px 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 14px;
+}
+.clip.fixed { border-style: dashed; color: var(--muted); grid-template-columns: 28px 1fr auto; }
+.clip.error { border-color: var(--danger); }
+.index { font-weight: 600; color: var(--muted); text-align: center; }
+.name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.name small { display: block; color: var(--danger); white-space: normal; }
+.meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.actions { display: flex; gap: 4px; }
+.actions button {
+  width: 30px; height: 30px; padding: 0;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; color: var(--text); cursor: pointer;
+}
+.actions button:disabled { opacity: 0.3; cursor: default; }
+
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.settings label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+select {
+  font: inherit; font-size: 14px; color: var(--text);
+  padding: 9px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+}
+
+button, .button {
+  font: inherit; font-weight: 600; font-size: 15px;
+  padding: 12px 20px; border-radius: 10px; border: none;
+  cursor: pointer; text-decoration: none; text-align: center;
+}
+.primary { background: var(--gradient); color: #fff; }
+.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+
+.progress-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; }
+.progress { height: 10px; background: var(--border); border-radius: 999px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--gradient); transition: width 0.1s linear; }
+
+.preview { width: 100%; max-height: 460px; background: #000; border-radius: 10px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+.notice { padding: 12px 16px; border-radius: 10px; font-size: 14px; }
+.notice.error { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.hint.error { margin: 0; color: var(--danger); font-size: 13px; }
+
+@media (max-width: 560px) {
+  .clip { grid-template-columns: 24px 1fr auto; }
+  .clip .meta { grid-column: 2; grid-row: 2; }
+  .clip .actions { grid-column: 3; grid-row: 1 / span 2; }
+}
