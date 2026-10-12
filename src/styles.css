@@ -104,12 +104,29 @@ input.text {
 }
 input.text:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
 
+.pill-style { display: grid; gap: 10px; }
+.pill-preview {
+  justify-self: start;
+  max-width: 100%;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  box-shadow: 0 0 0 1px var(--border);
+}
+.color-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; }
+.color-row input[type='color'] { width: 44px; height: 32px; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); cursor: pointer; }
+.color-row input[type='range'] { width: 100%; accent-color: var(--blue); }
+.color-row:has(input[type='range']) { grid-template-columns: 1fr 44px; }
+button.link { justify-self: start; padding: 0; font-size: 13px; color: var(--blue); background: none; }
+button.link:disabled { opacity: 0.5; }
 .position { display: grid; gap: 6px; font-size: 13px; }
 .frame {
   display: grid;
   grid-template: repeat(3, 1fr) / repeat(3, 1fr);
-  width: min(100%, 240px);
-  max-height: 240px;
+  height: 150px;
+  max-width: 100%;
   background: #1d2129;
   border-radius: 8px;
   overflow: hidden;

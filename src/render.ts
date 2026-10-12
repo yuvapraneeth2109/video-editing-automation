@@ -42,7 +42,14 @@ const PILL_FADE = 0.4;
 const MOTION_SCALE = 1.12;
 
 /** A caption shown in a rounded box over one clip. */
-export type TextPill = { text: string; position: PillPosition };
+export type TextPill = {
+  text: string;
+  position: PillPosition;
+  /** Any CSS colour, e.g. rgba(15, 17, 21, 0.72). */
+  background: string;
+  color: string;
+  fontFamily: string;
+};
 
 export type RenderClip = {
   file: File;
@@ -210,10 +217,11 @@ const wrapText = (ctx: OffscreenCanvasRenderingContext2D, text: string, maxWidth
 };
 
 /** Lays out a text pill once and returns a function that draws it at a given opacity. */
-const createPill = (ctx: OffscreenCanvasRenderingContext2D, { text, position }: TextPill, width: number, height: number) => {
+const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, width: number, height: number) => {
+  const { text, position, background, color, fontFamily } = pill;
   const base = Math.min(width, height);
   const fontSize = Math.round(base * 0.042);
-  const font = `600 ${fontSize}px system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif`;
+  const font = `600 ${fontSize}px ${fontFamily}`;
   const padX = fontSize * 0.9;
   const padY = fontSize * 0.55;
   const lineHeight = fontSize * 1.3;
@@ -235,12 +243,12 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, { text, position }: 
     if (alpha <= 0) return;
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.fillStyle = 'rgba(15, 17, 21, 0.72)';
+    ctx.fillStyle = background;
     ctx.beginPath();
     ctx.roundRect(x, y, boxW, boxH, radius);
     ctx.fill();
     ctx.font = font;
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = color;
     ctx.textAlign = align;
     ctx.textBaseline = 'middle';
     lines.forEach((line, i) => ctx.fillText(line, textX, y + padY + lineHeight * (i + 0.5)));

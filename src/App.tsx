@@ -8,6 +8,8 @@ import {
   planTimeline,
   type ClipInfo,
   type Motion,
+  PILL_FONTS,
+  type PillFont,
   type PillPosition,
   type Size,
   type Transition,
@@ -22,7 +24,8 @@ type AudioTrack = { file: File } & (
   | { status: 'error'; error: string }
 );
 
-type Pill = { enabled: boolean; text: string; position: PillPosition };
+type PillStyle = { background: string; opacity: number; color: string; font: PillFont };
+type Pill = { enabled: boolean; text: string; position: PillPosition } & PillStyle;
 
 type Clip = { id: string; file: File; voiceover: AudioTrack | null; pill: Pill; motion: Motion; transition: Transition } & (
   | { status: 'probing' }
@@ -40,10 +43,22 @@ type Job =
 
 const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
   '1080p, shape of first clip (recommended)': (first) => autoSize(first, 1080),
-  'Original size, up to 4K (slower)': (first) => autoSize(first),
+  '720p, shape of first clip (fastest)': (first) => autoSize(first, 720),
   '1080p landscape (1920×1080)': () => ({ width: 1920, height: 1080 }),
   '1080p portrait (1080×1920)': () => ({ width: 1080, height: 1920 }),
+  '1080p square (1080×1080)': () => ({ width: 1080, height: 1080 }),
+  '720p landscape (1280×720)': () => ({ width: 1280, height: 720 }),
+  '720p portrait (720×1280)': () => ({ width: 720, height: 1280 }),
+  'Original size, up to 4K (slower)': (first) => autoSize(first),
   '4K landscape (slowest)': () => ({ width: 3840, height: 2160 }),
+};
+const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
+const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
+
+/** '#rrggbb' + 0–100 opacity → CSS rgba(). */
+const toRgba = (hex: string, opacity: number) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${opacity / 100})`;
 };
 const TRANSITION_SECONDS = [0.5, 0.75, 1, 1.5];
 const TRANSITIONS = Object.keys(TRANSITION_LABELS) as Transition[];
@@ -124,6 +139,64 @@ function VolumeSlider({ value, onChange, disabled }: { value: number; onChange: 
   );
 }
 
+/** Background colour + opacity, text colour and font for one pill, with a live preview. */
+function PillStyleEditor({ pill, disabled, onChange, onApplyAll }: { pill: Pill; disabled: boolean; onChange: (patch: Partial<PillStyle>) => void; onApplyAll: () => void }) {
+  return (
+    <div className="pill-style">
+      <span
+        className="pill-preview"
+        style={{ background: toRgba(pill.background, pill.opacity), color: pill.color, fontFamily: PILL_FONTS[pill.font].family }}
+      >
+        {pill.text}
+      </span>
+      <div className="effects">
+        <label>
+          Background colour
+          <span className="color-row">
+            <input type="color" value={pill.background} disabled={disabled} onChange={(e) => onChange({ background: e.target.value })} />
+            <span className="meta">{pill.background.toUpperCase()}</span>
+          </span>
+        </label>
+        <label>
+          Background opacity
+          <span className="color-row">
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={pill.opacity}
+              disabled={disabled}
+              onChange={(e) => onChange({ opacity: Number(e.target.value) })}
+            />
+            <span className="meta">{pill.opacity}%</span>
+          </span>
+        </label>
+        <label>
+          Text colour
+          <span className="color-row">
+            <input type="color" value={pill.color} disabled={disabled} onChange={(e) => onChange({ color: e.target.value })} />
+            <span className="meta">{pill.color.toUpperCase()}</span>
+          </span>
+        </label>
+        <label>
+          Font
+          <select value={pill.font} disabled={disabled} onChange={(e) => onChange({ font: e.target.value as PillFont })}>
+            {PILL_FONT_KEYS.map((f) => (
+              <option key={f} value={f} style={{ fontFamily: PILL_FONTS[f].family }}>
+                {PILL_FONTS[f].label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <button className="link" disabled={disabled} onClick={onApplyAll}>
+        Use this style for all pills
+      </button>
+    </div>
+  );
+}
+
 /** A miniature frame: click a cell to place the pill there. */
 function PositionPicker({ value, aspect, disabled, onChange }: { value: PillPosition; aspect: number; disabled: boolean; onChange: (p: PillPosition) => void }) {
   return (
@@ -160,6 +233,7 @@ export default function App() {
   const [logoSeconds, setLogoSeconds] = useState(3);
   const [fastFps, setFastFps] = useState(true);
   const [transitionSeconds, setTransitionSeconds] = useState(0.75);
+  const [pillDefaults, setPillDefaults] = useState<PillStyle>(DEFAULT_PILL_STYLE);
   const [defaults, setDefaults] = useState<{ transition: Transition; motion: Motion }>({ transition: 'dissolve', motion: 'none' });
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
@@ -212,7 +286,7 @@ export default function App() {
       file,
       status: 'probing',
       voiceover: null,
-      pill: { enabled: false, text: '', position: 'bottom-center' },
+      pill: { enabled: false, text: '', position: 'bottom-center', ...pillDefaults },
       ...defaults,
     }));
     setClips((prev) => [...prev, ...added]);
@@ -231,6 +305,13 @@ export default function App() {
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
 
   const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
+
+  /** Copies one pill's colours and font to every clip's pill and to clips added later. */
+  const applyPillStyleToAll = ({ background, opacity, color, font }: PillStyle) => {
+    const style = { background, opacity, color, font };
+    setPillDefaults(style);
+    setClips((prev) => prev.map((c) => ({ ...c, pill: { ...c.pill, ...style } })));
+  };
 
   /** Applies a transition or motion to every clip and to clips added later. */
   const setForAll = (patch: Partial<{ transition: Transition; motion: Motion }>) => {
@@ -295,7 +376,16 @@ export default function App() {
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
-          pill: c.pill.enabled && c.pill.text.trim() ? { text: c.pill.text, position: c.pill.position } : undefined,
+          pill:
+            c.pill.enabled && c.pill.text.trim()
+              ? {
+                  text: c.pill.text,
+                  position: c.pill.position,
+                  background: toRgba(c.pill.background, c.pill.opacity),
+                  color: c.pill.color,
+                  fontFamily: PILL_FONTS[c.pill.font].family,
+                }
+              : undefined,
         })),
         logo,
         size: SIZE_PRESETS[preset](ready[0].info),
@@ -497,6 +587,15 @@ export default function App() {
                           disabled={busy}
                           autoFocus
                           onChange={(e) => updatePill(clip, { text: e.target.value })}
+                        />
+                      )}
+
+                      {clip.pill.enabled && clip.pill.text.trim() && (
+                        <PillStyleEditor
+                          pill={clip.pill}
+                          disabled={busy}
+                          onChange={(patch) => updatePill(clip, patch)}
+                          onApplyAll={() => applyPillStyleToAll(clip.pill)}
                         />
                       )}
 

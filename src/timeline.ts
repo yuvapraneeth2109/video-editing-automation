@@ -30,6 +30,20 @@ export const MOTION_LABELS: Record<Motion, string> = {
   'zoom-in-out': 'Zoom in, then out',
 };
 
+/** Fonts for text pills: installed on virtually every Mac, Windows PC and phone, so no download is needed. */
+export const PILL_FONTS = {
+  system: { label: 'System (clean sans)', family: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" },
+  helvetica: { label: 'Helvetica / Arial', family: "'Helvetica Neue', Helvetica, Arial, sans-serif" },
+  verdana: { label: 'Verdana', family: 'Verdana, Geneva, sans-serif' },
+  trebuchet: { label: 'Trebuchet', family: "'Trebuchet MS', sans-serif" },
+  georgia: { label: 'Georgia (serif)', family: "Georgia, 'Times New Roman', serif" },
+  times: { label: 'Times New Roman', family: "'Times New Roman', Times, serif" },
+  courier: { label: 'Courier (typewriter)', family: "'Courier New', Courier, monospace" },
+  impact: { label: 'Impact (bold headline)', family: "Impact, 'Arial Black', sans-serif" },
+} as const;
+
+export type PillFont = keyof typeof PILL_FONTS;
+
 /** Transitions where the next clip starts before the current one ends. */
 const OVERLAPS: ReadonlySet<Transition> = new Set(['dissolve', 'slide', 'wipe']);
 
