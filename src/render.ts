@@ -2,6 +2,8 @@ import {
   MATROSKA,
   MP4,
   QTFF,
+  QUALITY_HIGH,
+  QUALITY_MEDIUM,
   QUALITY_VERY_HIGH,
   WEBM,
   AudioBufferSink,
@@ -26,6 +28,7 @@ import {
   type Motion,
   type PillPosition,
   type PlannedClip,
+  type Quality,
   type Size,
   type Transition,
 } from './timeline';
@@ -63,8 +66,8 @@ export type RenderClip = {
   /** Plays from the start of this clip and is cut at its end. */
   voiceover?: AudioBuffer;
   pill?: TextPill;
-  /** An image shown over this clip, fitted inside the grid cells it covers. */
-  image?: { bitmap: ImageBitmap; cells: number[] };
+  /** Images shown over this clip (later ones on top), each fitted inside the grid cells it covers. */
+  images: { bitmap: ImageBitmap; cells: number[] }[];
 };
 
 export type RenderOptions = {
@@ -74,6 +77,7 @@ export type RenderOptions = {
   fps: number;
   logoSeconds: number;
   transitionSeconds: number;
+  quality: Quality;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
@@ -334,7 +338,8 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   let stage = 'Preparing';
   onProgress(0, stage);
 
-  const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: QUALITY_VERY_HIGH });
+  const videoBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
+  const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: videoBitrate });
   if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
   const audioCodec = await getFirstEncodableAudioCodec(['aac', 'opus'], {
     numberOfChannels: CHANNELS,
@@ -348,7 +353,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   ctx.imageSmoothingQuality = 'high';
 
   const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
-  const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: QUALITY_VERY_HIGH, keyFrameInterval: 2 });
+  const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: videoBitrate, keyFrameInterval: 2 });
   const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
   output.addVideoTrack(videoSource, { frameRate: fps });
   output.addAudioTrack(audioSource);
@@ -515,7 +520,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       })(),
     );
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
-    const drawImage = clip.image?.cells.length ? createImageOverlay(ctx, clip.image.bitmap, clip.image.cells, width, height) : null;
+    const drawImages = clip.images.map(({ bitmap, cells }) => createImageOverlay(ctx, bitmap, cells, width, height));
     const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
     let k = 0;
 
@@ -540,7 +545,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
           ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
-        drawImage?.(overlayAlpha);
+        drawImages.forEach((draw) => draw(overlayAlpha));
         drawPill?.(overlayAlpha);
         ctx.restore();
         k++;

@@ -9,10 +9,14 @@ import {
   type ClipInfo,
   type Motion,
   GRID,
+  CUSTOM_SIZE_LIMITS,
   PILL_FONTS,
+  QUALITY_LABELS,
   cellBounds,
+  customSize,
   type PillFont,
   type PillPosition,
+  type Quality,
   type Size,
   type Transition,
 } from './timeline';
@@ -30,7 +34,7 @@ type PillStyle = { background: string; opacity: number; color: string; font: Pil
 type Pill = { enabled: boolean; text: string; position: PillPosition } & PillStyle;
 
 /** An image overlay: decoded once when chosen; `url` previews it in the placement grid. */
-type Overlay = { file: File; url: string; cells: number[] } & (
+type Overlay = { id: string; file: File; url: string; cells: number[] } & (
   | { status: 'loading' }
   | { status: 'ready'; bitmap: ImageBitmap }
   | { status: 'error'; error: string }
@@ -41,7 +45,7 @@ type Clip = {
   file: File;
   voiceover: AudioTrack | null;
   pill: Pill;
-  image: { enabled: boolean; overlay: Overlay | null };
+  images: Overlay[];
   motion: Motion;
   transition: Transition;
 } & (
@@ -58,27 +62,38 @@ type Job =
   | { state: 'done'; url: string; size: number; seconds: number }
   | { state: 'error'; message: string };
 
+const CUSTOM_PRESET = 'Custom size (type width × height)';
 const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
   '1080p, shape of first clip (recommended)': (first) => autoSize(first, 1080),
   '720p, shape of first clip (fastest)': (first) => autoSize(first, 720),
-  '1080p landscape (1920×1080)': () => ({ width: 1920, height: 1080 }),
-  '1080p portrait (1080×1920)': () => ({ width: 1080, height: 1920 }),
-  '1080p square (1080×1080)': () => ({ width: 1080, height: 1080 }),
-  '720p landscape (1280×720)': () => ({ width: 1280, height: 720 }),
-  '720p portrait (720×1280)': () => ({ width: 720, height: 1280 }),
   'Original size, up to 4K (slower)': (first) => autoSize(first),
-  '4K landscape (slowest)': () => ({ width: 3840, height: 2160 }),
+  '1080p landscape (1920×1080)': () => ({ width: 1920, height: 1080 }),
+  '720p landscape (1280×720)': () => ({ width: 1280, height: 720 }),
+  '4K landscape (3840×2160)': () => ({ width: 3840, height: 2160 }),
+  '1080p portrait (1080×1920)': () => ({ width: 1080, height: 1920 }),
+  '720p portrait (720×1280)': () => ({ width: 720, height: 1280 }),
+  '1080p square (1080×1080)': () => ({ width: 1080, height: 1080 }),
 };
+const SIZE_GROUPS: [string, string[]][] = [
+  ['Match your clips', Object.keys(SIZE_PRESETS).slice(0, 3)],
+  ['Custom', [CUSTOM_PRESET]],
+  ['Landscape', Object.keys(SIZE_PRESETS).slice(3, 6)],
+  ['Portrait & square', Object.keys(SIZE_PRESETS).slice(6)],
+];
 const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 /** Large photos are scaled down to this on their long edge — plenty for 4K output, far less memory. */
 const IMAGE_MAX_EDGE = 2048;
-/** New images start in the top-right box. */
-const DEFAULT_IMAGE_CELLS = [2];
+/** New images start in a free corner (2×2 boxes): top-right, top-left, bottom-right, bottom-left. */
+const CORNERS = [
+  [GRID - 2, GRID - 1, 2 * GRID - 2, 2 * GRID - 1],
+  [0, 1, GRID, GRID + 1],
+  [GRID * GRID - GRID - 2, GRID * GRID - GRID - 1, GRID * GRID - 2, GRID * GRID - 1],
+  [GRID * (GRID - 2), GRID * (GRID - 2) + 1, GRID * (GRID - 1), GRID * (GRID - 1) + 1],
+];
 
 /** Releases an overlay's preview URL and decoded pixels. */
-const freeOverlay = (overlay: Overlay | null | undefined) => {
-  if (!overlay) return;
+const freeOverlay = (overlay: Overlay) => {
   URL.revokeObjectURL(overlay.url);
   if (overlay.status === 'ready') overlay.bitmap.close();
 };
@@ -240,39 +255,76 @@ function PillStyleEditor({ pill, disabled, onChange, onApplyAll }: { pill: Pill;
 }
 
 /** A miniature frame: click boxes to choose where the image goes; it fills the rectangle around them. */
-function ImagePlacement({ overlay, aspect, disabled, onChange }: { overlay: Overlay; aspect: number; disabled: boolean; onChange: (cells: number[]) => void }) {
-  const area = overlay.cells.length ? cellBounds(overlay.cells) : null;
+type ImagePlacementProps = { overlay: Overlay; others: Overlay[]; aspect: number; disabled: boolean; onChange: (cells: number[]) => void };
+
+/** Positions an image preview over the grid boxes it covers. */
+const areaStyle = (cells: number[]) => {
+  const { col, row, cols, rows } = cellBounds(cells);
+  return { left: `${(col / GRID) * 100}%`, top: `${(row / GRID) * 100}%`, width: `${(cols / GRID) * 100}%`, height: `${(rows / GRID) * 100}%` };
+};
+
+function ImagePlacement({ overlay, others, aspect, disabled, onChange }: ImagePlacementProps) {
+  const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
+
+  /** The grid box under the pointer, clamped to the frame. */
+  const cellAt = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const clamp = (v: number) => Math.min(GRID - 1, Math.max(0, Math.floor(v * GRID)));
+    return clamp((e.clientY - r.top) / r.height) * GRID + clamp((e.clientX - r.left) / r.width);
+  };
+  /** Every box in the rectangle between two corner boxes. */
+  const rectangle = (a: number, b: number) => {
+    const { col, row, cols, rows } = cellBounds([a, b]);
+    return Array.from({ length: cols * rows }, (_, i) => (row + Math.floor(i / cols)) * GRID + col + (i % cols));
+  };
   const toggle = (cell: number) =>
     onChange(overlay.cells.includes(cell) ? overlay.cells.filter((c) => c !== cell) : [...overlay.cells, cell]);
+
+  const preview = drag ? rectangle(drag.from, drag.to) : null;
+  const shown = preview ?? overlay.cells;
+
   return (
     <div className="position">
-      <span className="muted">Placement and size — click the boxes the image should cover</span>
-      <div className="frame" style={{ aspectRatio: aspect }} aria-label="Image placement">
+      <span className="muted">Placement and size — drag across the boxes the image should cover (or click boxes to add/remove)</span>
+      <div
+        className="frame large"
+        style={{ aspectRatio: aspect, gridTemplate: `repeat(${GRID}, 1fr) / repeat(${GRID}, 1fr)` }}
+        aria-label="Image placement"
+        onPointerDown={(e) => {
+          if (disabled || e.button !== 0) return;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          const cell = cellAt(e);
+          setDrag({ from: cell, to: cell });
+        }}
+        onPointerMove={(e) => drag && setDrag({ ...drag, to: cellAt(e) })}
+        onPointerUp={() => {
+          if (!drag) return;
+          if (drag.from === drag.to) toggle(drag.from);
+          else onChange(rectangle(drag.from, drag.to));
+          setDrag(null);
+        }}
+        onPointerCancel={() => setDrag(null)}
+      >
         {Array.from({ length: GRID * GRID }, (_, cell) => (
           <button
             key={cell}
+            tabIndex={0}
             aria-pressed={overlay.cells.includes(cell)}
             aria-label={`Box ${cell + 1}`}
-            className={overlay.cells.includes(cell) ? 'selected' : ''}
+            className={shown.includes(cell) ? 'selected' : ''}
             disabled={disabled}
-            onClick={() => toggle(cell)}
+            // Pointer clicks are handled by the frame; this keeps Enter/Space working for keyboard users.
+            onClick={(e) => e.detail === 0 && toggle(cell)}
           />
         ))}
-        {area && (
-          <img
-            className="frame-image"
-            src={overlay.url}
-            alt=""
-            style={{
-              left: `${(area.col / GRID) * 100}%`,
-              top: `${(area.row / GRID) * 100}%`,
-              width: `${(area.cols / GRID) * 100}%`,
-              height: `${(area.rows / GRID) * 100}%`,
-            }}
-          />
-        )}
+        {others
+          .filter((o) => o.cells.length)
+          .map((o) => (
+            <img key={o.id} className="frame-image other" src={o.url} alt="" style={areaStyle(o.cells)} />
+          ))}
+        {shown.length > 0 && <img className="frame-image" src={overlay.url} alt="" style={areaStyle(shown)} />}
       </div>
-      {!area && <p className="hint warn">Select at least one box, or the image won't be shown.</p>}
+      {!overlay.cells.length && <p className="hint warn">Select at least one box, or this image won't be shown.</p>}
     </div>
   );
 }
@@ -310,6 +362,8 @@ export default function App() {
   const [voiceVolume, setVoiceVolume] = useState(100);
   const [musicVolume, setMusicVolume] = useState(20);
   const [preset, setPreset] = useState(Object.keys(SIZE_PRESETS)[0]);
+  const [custom, setCustom] = useState<Size>({ width: 1920, height: 1080 });
+  const [quality, setQuality] = useState<Quality>('very-high');
   const [logoSeconds, setLogoSeconds] = useState(3);
   const [fastFps, setFastFps] = useState(true);
   const [transitionSeconds, setTransitionSeconds] = useState(0.75);
@@ -318,13 +372,15 @@ export default function App() {
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const clipsRef = useRef(clips);
+  clipsRef.current = clips;
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
   const perClip = voiceMode === 'per-clip';
   const activeTracks = [music, ...(perClip ? clips.map((c) => c.voiceover) : [voiceover])];
   const audioPending = activeTracks.some((t) => t && t.status !== 'ready');
-  const overlays = clips.filter((c) => c.image.enabled).map((c) => c.image.overlay);
+  const overlays = clips.flatMap((c) => c.images);
   const hasError =
     clips.some((c) => c.status === 'error') || [...activeTracks, ...overlays].some((t) => t?.status === 'error');
   const canExport =
@@ -335,7 +391,8 @@ export default function App() {
   const voiceOverflow =
     !perClip && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (totalSeconds - logoSeconds) : 0;
   const hasAnyVoice = perClip ? clips.some((c) => c.voiceover?.status === 'ready') : voiceover?.status === 'ready';
-  const outputSize = ready[0] ? SIZE_PRESETS[preset](ready[0].info) : null;
+  const sizeFor = (first: ClipInfo) => (preset === CUSTOM_PRESET ? customSize(custom.width, custom.height) : SIZE_PRESETS[preset](first));
+  const outputSize = ready[0] ? sizeFor(ready[0].info) : null;
   const aspect = outputSize ? outputSize.width / outputSize.height : 16 / 9;
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion'>(key: K) =>
@@ -369,7 +426,7 @@ export default function App() {
       file,
       status: 'probing',
       voiceover: null,
-      image: { enabled: false, overlay: null },
+      images: [],
       pill: { enabled: false, text: '', position: 'bottom-center', ...pillDefaults },
       ...defaults,
     }));
@@ -390,28 +447,38 @@ export default function App() {
 
   const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
 
-  /** Patches a clip's image overlay; frees the old image when it is replaced or removed. */
-  const updateImage = (clip: Clip, patch: Partial<Clip['image']>) => {
-    const old = clip.image.overlay;
-    if ('overlay' in patch && patch.overlay?.file !== old?.file) freeOverlay(old);
-    update(clip.id, { image: { ...clip.image, ...patch } });
+  /** Patches one image of a clip. */
+  const updateImage = (clipId: string, imageId: string, patch: Partial<Overlay>) =>
+    setClips((prev) =>
+      prev.map((c) =>
+        c.id === clipId ? { ...c, images: c.images.map((o) => (o.id === imageId ? ({ ...o, ...patch } as Overlay) : o)) } : c,
+      ),
+    );
+
+  const removeImage = (clip: Clip, overlay: Overlay) => {
+    freeOverlay(overlay);
+    update(clip.id, { images: clip.images.filter((o) => o !== overlay) });
   };
 
-  const addImage = async (clip: Clip, file: File) => {
-    const overlay: Overlay = { file, url: URL.createObjectURL(file), cells: clip.image.overlay?.cells ?? DEFAULT_IMAGE_CELLS, status: 'loading' };
-    updateImage(clip, { overlay });
-    const settle = (patch: Partial<Overlay>) =>
-      setClips((prev) =>
-        prev.map((c) =>
-          c.id === clip.id && c.image.overlay?.file === file
-            ? { ...c, image: { ...c.image, overlay: { ...c.image.overlay, ...patch } as Overlay } }
-            : c,
-        ),
+  /** Adds images to a clip, each starting in the next free corner, and decodes them in the background. */
+  const addImages = (clip: Clip, files: File[]) => {
+    const added: Overlay[] = files.map((file, i) => ({
+      id: crypto.randomUUID(),
+      file,
+      url: URL.createObjectURL(file),
+      cells: CORNERS[(clip.images.length + i) % CORNERS.length],
+      status: 'loading',
+    }));
+    update(clip.id, { images: [...clip.images, ...added] });
+    for (const overlay of added) {
+      decodeImage(overlay.file).then(
+        (bitmap) => {
+          // If the image was removed while decoding, release it instead of storing it.
+          if (!clipsRef.current.some((c) => c.images.some((o) => o.id === overlay.id))) bitmap.close();
+          else updateImage(clip.id, overlay.id, { status: 'ready', bitmap });
+        },
+        () => updateImage(clip.id, overlay.id, { status: 'error', error: 'This image could not be read.' }),
       );
-    try {
-      settle({ status: 'ready', bitmap: await decodeImage(file) });
-    } catch {
-      settle({ status: 'error', error: 'This image could not be read.' });
     }
   };
 
@@ -467,7 +534,7 @@ export default function App() {
     });
 
   const remove = (id: string) => {
-    freeOverlay(clips.find((c) => c.id === id)?.image.overlay);
+    clips.find((c) => c.id === id)?.images.forEach(freeOverlay);
     setClips((prev) => prev.filter((c) => c.id !== id));
   };
 
@@ -488,10 +555,7 @@ export default function App() {
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
-          image:
-            c.image.enabled && c.image.overlay?.status === 'ready' && c.image.overlay.cells.length
-              ? { bitmap: c.image.overlay.bitmap, cells: c.image.overlay.cells }
-              : undefined,
+          images: c.images.flatMap((o) => (o.status === 'ready' && o.cells.length ? [{ bitmap: o.bitmap, cells: o.cells }] : [])),
           pill:
             c.pill.enabled && c.pill.text.trim()
               ? {
@@ -504,10 +568,11 @@ export default function App() {
               : undefined,
         })),
         logo,
-        size: SIZE_PRESETS[preset](ready[0].info),
+        size: sizeFor(ready[0].info),
         fps,
         logoSeconds,
         transitionSeconds,
+        quality,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
@@ -533,7 +598,7 @@ export default function App() {
   };
 
   const reset = () => {
-    clips.forEach((c) => freeOverlay(c.image.overlay));
+    clips.forEach((c) => c.images.forEach(freeOverlay));
     setClips([]);
     setVoiceover(null);
     setMusic(null);
@@ -725,57 +790,49 @@ export default function App() {
                         />
                       )}
 
-                      <label className="toggle">
-                        <input
-                          type="checkbox"
-                          checked={clip.image.enabled}
-                          disabled={busy}
-                          onChange={(e) => updateImage(clip, { enabled: e.target.checked })}
-                        />
-                        Add an image over this clip
-                      </label>
-
-                      {clip.image.enabled &&
-                        (clip.image.overlay ? (
-                          <div className={`slot-file${clip.image.overlay.status === 'error' ? ' error' : ''}`}>
-                            <span className="name" title={clip.image.overlay.file.name}>
-                              {clip.image.overlay.file.name}
-                              {clip.image.overlay.status === 'error' && <small>{clip.image.overlay.error}</small>}
-                            </span>
-                            <span className="meta">
-                              {clip.image.overlay.status === 'loading' && 'Reading…'}
-                              {clip.image.overlay.status === 'ready' &&
-                                `${clip.image.overlay.bitmap.width}×${clip.image.overlay.bitmap.height}`}
-                            </span>
-                            <span className="actions">
-                              <button onClick={() => updateImage(clip, { overlay: null })} disabled={busy} aria-label="Remove image">✕</button>
-                            </span>
+                      <div className="images">
+                        <span className="muted">Images over this clip</span>
+                        {clip.images.map((overlay, n) => (
+                          <div key={overlay.id} className="image-item">
+                            <div className={`slot-file${overlay.status === 'error' ? ' error' : ''}`}>
+                              <span className="name" title={overlay.file.name}>
+                                {n + 1}. {overlay.file.name}
+                                {overlay.status === 'error' && <small>{overlay.error}</small>}
+                              </span>
+                              <span className="meta">
+                                {overlay.status === 'loading' && 'Reading…'}
+                                {overlay.status === 'ready' && `${overlay.bitmap.width}×${overlay.bitmap.height}`}
+                              </span>
+                              <span className="actions">
+                                <button onClick={() => removeImage(clip, overlay)} disabled={busy} aria-label="Remove image">✕</button>
+                              </span>
+                            </div>
+                            {overlay.status === 'ready' && (
+                              <ImagePlacement
+                                overlay={overlay}
+                                others={clip.images.filter((o) => o !== overlay)}
+                                aspect={aspect}
+                                disabled={busy}
+                                onChange={(cells) => updateImage(clip.id, overlay.id, { cells })}
+                              />
+                            )}
                           </div>
-                        ) : (
-                          <label className={`slot-pick${busy ? ' disabled' : ''}`}>
-                            + Choose image (PNG, JPG, WebP)
-                            <input
-                              type="file"
-                              accept="image/png,image/jpeg,image/webp,image/gif"
-                              hidden
-                              disabled={busy}
-                              onChange={(e) => {
-                                const file = e.target.files?.[0];
-                                if (file) void addImage(clip, file);
-                                e.target.value = '';
-                              }}
-                            />
-                          </label>
                         ))}
-
-                      {clip.image.enabled && clip.image.overlay?.status === 'ready' && (
-                        <ImagePlacement
-                          overlay={clip.image.overlay}
-                          aspect={aspect}
-                          disabled={busy}
-                          onChange={(cells) => updateImage(clip, { overlay: { ...clip.image.overlay!, cells } })}
-                        />
-                      )}
+                        <label className={`slot-pick${busy ? ' disabled' : ''}`}>
+                          + Add image{clip.images.length ? ' (another)' : ''} — PNG, JPG, WebP
+                          <input
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp,image/gif"
+                            multiple
+                            hidden
+                            disabled={busy}
+                            onChange={(e) => {
+                              addImages(clip, Array.from(e.target.files ?? []));
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                      </div>
                     </div>
                   )}
                 </li>
@@ -874,8 +931,49 @@ export default function App() {
             <label>
               Output size
               <select value={preset} onChange={(e) => setPreset(e.target.value)} disabled={busy}>
-                {Object.keys(SIZE_PRESETS).map((p) => (
-                  <option key={p}>{p}</option>
+                {SIZE_GROUPS.map(([group, options]) => (
+                  <optgroup key={group} label={group}>
+                    {options.map((p) => (
+                      <option key={p}>{p}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              {preset === CUSTOM_PRESET ? (
+                <span className="custom-size">
+                  {(['width', 'height'] as const).map((side, i) => (
+                    <span key={side} className="custom-side">
+                      {i > 0 && <span aria-hidden="true">×</span>}
+                      <input
+                        className="text"
+                        type="number"
+                        inputMode="numeric"
+                        aria-label={`${side} in pixels`}
+                        min={CUSTOM_SIZE_LIMITS.min}
+                        max={CUSTOM_SIZE_LIMITS.max}
+                        step={2}
+                        value={custom[side]}
+                        disabled={busy}
+                        onChange={(e) => setCustom((c) => ({ ...c, [side]: Number(e.target.value) }))}
+                        onBlur={() => setCustom((c) => customSize(c.width, c.height))}
+                      />
+                    </span>
+                  ))}
+                  <span>px</span>
+                </span>
+              ) : null}
+              {outputSize && (
+                <span className="meta">
+                  Exports at {outputSize.width}×{outputSize.height}
+                  {preset === CUSTOM_PRESET && ` · ${CUSTOM_SIZE_LIMITS.min}–${CUSTOM_SIZE_LIMITS.max} px, even numbers`}
+                </span>
+              )}
+            </label>
+            <label>
+              Quality
+              <select value={quality} onChange={(e) => setQuality(e.target.value as Quality)} disabled={busy}>
+                {(Object.keys(QUALITY_LABELS) as Quality[]).map((q) => (
+                  <option key={q} value={q}>{QUALITY_LABELS[q]}</option>
                 ))}
               </select>
             </label>

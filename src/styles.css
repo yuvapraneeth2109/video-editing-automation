@@ -149,6 +149,14 @@ button.link:disabled { opacity: 0.5; }
   object-fit: contain;
   pointer-events: none;
 }
+.frame.large { height: 216px; touch-action: none; user-select: none; }
+.frame.large button { border-color: rgba(255, 255, 255, 0.1); }
+.frame-image.other { opacity: 0.35; }
+.custom-size { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.custom-side { display: flex; align-items: center; gap: 8px; }
+.custom-size input { width: 92px; }
+.images { display: grid; gap: 10px; }
+.image-item { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; }
 .mini-pill { width: 60%; max-width: 48px; height: 10px; border-radius: 999px; background: #fff; }
 
 .mode { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }

@@ -44,8 +44,8 @@ export const PILL_FONTS = {
 
 export type PillFont = keyof typeof PILL_FONTS;
 
-/** Overlays are placed on a 3×3 grid; cells are numbered 0–8, left to right, top to bottom. */
-export const GRID = 3;
+/** Images are placed on a 6×6 grid; cells are numbered 0–35, left to right, top to bottom. */
+export const GRID = 6;
 
 /** The rectangle (in whole cells) that covers every selected cell. */
 export function cellBounds(cells: number[]) {
@@ -73,6 +73,24 @@ export function autoSize(first: ClipInfo, shortEdge?: number): Size {
   const scale = Math.min(...limits);
   return { width: even(first.width * scale), height: even(first.height * scale) };
 }
+
+/** Smallest and largest custom output side, in pixels. */
+export const CUSTOM_SIZE_LIMITS = { min: 128, max: 3840 };
+
+/** Makes a typed-in size valid for H.264: whole even numbers within the limits. */
+export function customSize(width: number, height: number): Size {
+  const fix = (n: number) => even(Math.min(CUSTOM_SIZE_LIMITS.max, Math.max(CUSTOM_SIZE_LIMITS.min, n || 0)));
+  return { width: fix(width), height: fix(height) };
+}
+
+/** Encoding quality: higher means a sharper picture and a bigger file. */
+export type Quality = 'very-high' | 'high' | 'medium';
+
+export const QUALITY_LABELS: Record<Quality, string> = {
+  'very-high': 'Very high (best picture)',
+  high: 'High (smaller file)',
+  medium: 'Medium (smallest file)',
+};
 
 /** The highest clip frame rate (so motion stays smooth), capped at 60 — or at 30 when `fast`. */
 export function autoFps(clips: ClipInfo[], fast: boolean): number {
