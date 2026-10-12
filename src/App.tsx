@@ -1,21 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
 import logoUrl from './assets/logo.png';
-import type { ClipInfo, Size } from './render';
+import type { ClipInfo, PillPosition, Size } from './render';
 
 // The media engine is loaded on demand so the page itself paints instantly.
 const loadEngine = () => import('./render');
-
-type Clip = { id: string; file: File } & (
-  | { status: 'probing' }
-  | { status: 'ready'; info: ClipInfo }
-  | { status: 'error'; error: string }
-);
 
 type AudioTrack = { file: File } & (
   | { status: 'loading' }
   | { status: 'ready'; buffer: AudioBuffer }
   | { status: 'error'; error: string }
 );
+
+type Pill = { enabled: boolean; text: string; position: PillPosition };
+
+type Clip = { id: string; file: File; voiceover: AudioTrack | null; pill: Pill } & (
+  | { status: 'probing' }
+  | { status: 'ready'; info: ClipInfo }
+  | { status: 'error'; error: string }
+);
+
+type VoiceMode = 'whole' | 'per-clip';
 
 type Job =
   | { state: 'idle' }
@@ -33,6 +37,12 @@ const SIZE_PRESETS: Record<string, Size | null> = {
 const LOGO_SECONDS = [2, 3, 4, 5];
 /** Clip sound is lowered to this when a voiceover is added, so the voice stays clear. */
 const CLIP_VOLUME_UNDER_VOICE = 30;
+const PILL_MAX_LENGTH = 120;
+const PILL_POSITIONS: PillPosition[] = [
+  'top-left', 'top-center', 'top-right',
+  'middle-left', 'middle-center', 'middle-right',
+  'bottom-left', 'bottom-center', 'bottom-right',
+];
 const SUPPORTED = typeof VideoEncoder !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
 
 const formatTime = (s: number) => {
@@ -40,56 +50,49 @@ const formatTime = (s: number) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 };
 const formatBytes = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`);
+const readyBuffer = (track: AudioTrack | null) => (track?.status === 'ready' ? track.buffer : undefined);
 
-type AudioSlotProps = {
+type AudioPickerProps = {
   label: string;
-  hint: string;
   track: AudioTrack | null;
-  volume: number;
   disabled: boolean;
   onFile: (file: File) => void;
   onRemove: () => void;
-  onVolume: (volume: number) => void;
 };
 
-function AudioSlot({ label, hint, track, volume, disabled, onFile, onRemove, onVolume }: AudioSlotProps) {
+/** Shows a "+ Add" button, or the chosen file with its duration and a remove button. */
+function AudioPicker({ label, track, disabled, onFile, onRemove }: AudioPickerProps) {
+  if (!track) {
+    return (
+      <label className={`slot-pick${disabled ? ' disabled' : ''}`}>
+        + Add {label.toLowerCase()}
+        <input
+          type="file"
+          accept="audio/*,.mp3,.wav,.m4a,.aac"
+          hidden
+          disabled={disabled}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) onFile(file);
+            e.target.value = '';
+          }}
+        />
+      </label>
+    );
+  }
   return (
-    <div className={`slot${track?.status === 'error' ? ' error' : ''}`}>
-      <div className="slot-head">
-        <strong>{label}</strong>
-        <span className="muted">{hint}</span>
-      </div>
-      {track ? (
-        <div className="slot-file">
-          <span className="name" title={track.file.name}>
-            {track.file.name}
-            {track.status === 'error' && <small>{track.error}</small>}
-          </span>
-          <span className="meta">
-            {track.status === 'loading' && 'Reading…'}
-            {track.status === 'ready' && formatTime(track.buffer.duration)}
-          </span>
-          <span className="actions">
-            <button onClick={onRemove} disabled={disabled} aria-label={`Remove ${label}`}>✕</button>
-          </span>
-        </div>
-      ) : (
-        <label className={`slot-pick${disabled ? ' disabled' : ''}`}>
-          + Add {label.toLowerCase()}
-          <input
-            type="file"
-            accept="audio/*,.mp3,.wav,.m4a,.aac"
-            hidden
-            disabled={disabled}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) onFile(file);
-              e.target.value = '';
-            }}
-          />
-        </label>
-      )}
-      {track?.status === 'ready' && <VolumeSlider value={volume} onChange={onVolume} disabled={disabled} />}
+    <div className={`slot-file${track.status === 'error' ? ' error' : ''}`}>
+      <span className="name" title={track.file.name}>
+        {track.file.name}
+        {track.status === 'error' && <small>{track.error}</small>}
+      </span>
+      <span className="meta">
+        {track.status === 'loading' && 'Reading…'}
+        {track.status === 'ready' && formatTime(track.buffer.duration)}
+      </span>
+      <span className="actions">
+        <button onClick={onRemove} disabled={disabled} aria-label={`Remove ${label}`}>✕</button>
+      </span>
     </div>
   );
 }
@@ -104,8 +107,33 @@ function VolumeSlider({ value, onChange, disabled }: { value: number; onChange: 
   );
 }
 
+/** A miniature frame: click a cell to place the pill there. */
+function PositionPicker({ value, aspect, disabled, onChange }: { value: PillPosition; aspect: number; disabled: boolean; onChange: (p: PillPosition) => void }) {
+  return (
+    <div className="position">
+      <span className="muted">Position</span>
+      <div className="frame" style={{ aspectRatio: aspect }} role="radiogroup" aria-label="Pill position">
+        {PILL_POSITIONS.map((p) => (
+          <button
+            key={p}
+            role="radio"
+            aria-checked={p === value}
+            aria-label={p.replace('-', ' ')}
+            className={p === value ? 'selected' : ''}
+            disabled={disabled}
+            onClick={() => onChange(p)}
+          >
+            {p === value && <span className="mini-pill" />}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
   const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
   const [music, setMusic] = useState<AudioTrack | null>(null);
   const [clipVolume, setClipVolume] = useState(100);
@@ -119,12 +147,18 @@ export default function App() {
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
-  const audioPending = [voiceover, music].some((t) => t && t.status !== 'ready');
+  const perClip = voiceMode === 'per-clip';
+  const activeTracks = [music, ...(perClip ? clips.map((c) => c.voiceover) : [voiceover])];
+  const audioPending = activeTracks.some((t) => t && t.status !== 'ready');
+  const hasError = clips.some((c) => c.status === 'error') || activeTracks.some((t) => t?.status === 'error');
   const canExport = SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending;
   const clipsSeconds = ready.reduce((sum, c) => sum + c.info.duration, 0);
   const totalSeconds = clipsSeconds + (ready.length ? logoSeconds * 2 : 0);
   const voiceOverflow =
-    voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (clipsSeconds + logoSeconds) : 0;
+    !perClip && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (clipsSeconds + logoSeconds) : 0;
+  const hasAnyVoice = perClip ? clips.some((c) => c.voiceover?.status === 'ready') : voiceover?.status === 'ready';
+  const outputSize = SIZE_PRESETS[preset] ?? (ready[0] ? { width: ready[0].info.width, height: ready[0].info.height } : null);
+  const aspect = outputSize ? outputSize.width / outputSize.height : 16 / 9;
 
   // Warn before closing the tab mid-render; release the output file when it is replaced.
   useEffect(() => {
@@ -139,7 +173,13 @@ export default function App() {
   const addFiles = async (files: FileList | null) => {
     const videos = Array.from(files ?? []).filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name));
     if (!videos.length) return;
-    const added: Clip[] = videos.map((file) => ({ id: crypto.randomUUID(), file, status: 'probing' }));
+    const added: Clip[] = videos.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      status: 'probing',
+      voiceover: null,
+      pill: { enabled: false, text: '', position: 'bottom-center' },
+    }));
     setClips((prev) => [...prev, ...added]);
     setJob({ state: 'idle' });
 
@@ -152,11 +192,14 @@ export default function App() {
     }
   };
 
-  /** Decodes an audio file; ignores the result if the user replaced or removed it meanwhile. */
-  const addAudio = async (file: File, setTrack: typeof setVoiceover) => {
-    setTrack({ file, status: 'loading' });
+  const update = (id: string, patch: Partial<Clip>) =>
+    setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
+
+  const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
+
+  /** Decodes an audio file; `settle` ignores the result if the user replaced or removed it meanwhile. */
+  const decodeAudio = async (file: File, settle: (track: AudioTrack) => void) => {
     setJob({ state: 'idle' });
-    const settle = (track: AudioTrack) => setTrack((current) => (current?.file === file ? track : current));
     try {
       const { loadAudio } = await loadEngine();
       settle({ file, status: 'ready', buffer: await loadAudio(file) });
@@ -165,8 +208,24 @@ export default function App() {
     }
   };
 
-  const update = (id: string, patch: Partial<Clip>) =>
-    setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
+  const addVoiceover = (file: File, clipId?: string) => {
+    setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
+    const loading: AudioTrack = { file, status: 'loading' };
+    if (clipId) {
+      update(clipId, { voiceover: loading });
+      void decodeAudio(file, (track) =>
+        setClips((prev) => prev.map((c) => (c.id === clipId && c.voiceover?.file === file ? { ...c, voiceover: track } : c))),
+      );
+    } else {
+      setVoiceover(loading);
+      void decodeAudio(file, (track) => setVoiceover((current) => (current?.file === file ? track : current)));
+    }
+  };
+
+  const addMusic = (file: File) => {
+    setMusic({ file, status: 'loading' });
+    void decodeAudio(file, (track) => setMusic((current) => (current?.file === file ? track : current)));
+  };
 
   const move = (index: number, delta: number) =>
     setClips((prev) => {
@@ -190,14 +249,21 @@ export default function App() {
       const infos = ready.map((c) => c.info);
       let lastPaint = 0;
       const blob = await renderVideo({
-        clips: ready.map((c) => ({ file: c.file, info: c.info })),
+        clips: ready.map((c) => ({
+          file: c.file,
+          info: c.info,
+          voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
+          pill: c.pill.enabled && c.pill.text.trim() ? { text: c.pill.text, position: c.pill.position } : undefined,
+        })),
         logo,
         size: SIZE_PRESETS[preset] ?? autoSize(infos[0]),
         fps: autoFps(infos),
         logoSeconds,
         clipVolume: clipVolume / 100,
-        voiceover: voiceover?.status === 'ready' ? { buffer: voiceover.buffer, volume: voiceVolume / 100 } : undefined,
-        music: music?.status === 'ready' ? { buffer: music.buffer, volume: musicVolume / 100 } : undefined,
+        voiceVolume: voiceVolume / 100,
+        musicVolume: musicVolume / 100,
+        voiceover: perClip ? undefined : readyBuffer(voiceover),
+        music: readyBuffer(music),
         signal: controller.signal,
         onProgress: (progress) => {
           const now = performance.now();
@@ -273,35 +339,117 @@ export default function App() {
               {clips.length} clip{clips.length > 1 ? 's' : ''} · {formatTime(totalSeconds)} with logo
             </span>
           </div>
+
+          <div className="mode" role="radiogroup" aria-label="Voiceover">
+            <span className="muted">Voiceover</span>
+            {(['whole', 'per-clip'] as const).map((mode) => (
+              <button
+                key={mode}
+                role="radio"
+                aria-checked={voiceMode === mode}
+                className={voiceMode === mode ? 'selected' : ''}
+                disabled={busy}
+                onClick={() => setVoiceMode(mode)}
+              >
+                {mode === 'whole' ? 'One file for the whole video' : 'Separate file for each clip'}
+              </button>
+            ))}
+          </div>
+
           <ol className="clips">
             <li className="clip fixed">
-              <span className="index">★</span>
-              <span className="name">Logo intro</span>
-              <span className="meta">{logoSeconds}s</span>
+              <div className="clip-row">
+                <span className="index">★</span>
+                <span className="name">Logo intro</span>
+                <span className="meta">{logoSeconds}s</span>
+              </div>
             </li>
-            {clips.map((clip, i) => (
-              <li key={clip.id} className={`clip ${clip.status}`}>
-                <span className="index">{i + 1}</span>
-                <span className="name" title={clip.file.name}>
-                  {clip.file.name}
-                  {clip.status === 'error' && <small>{clip.error}</small>}
-                </span>
-                <span className="meta">
-                  {clip.status === 'probing' && 'Reading…'}
-                  {clip.status === 'ready' &&
-                    `${clip.info.width}×${clip.info.height} · ${Math.round(clip.info.fps)} fps · ${formatTime(clip.info.duration)}`}
-                </span>
-                <span className="actions">
-                  <button onClick={() => move(i, -1)} disabled={busy || i === 0} aria-label="Move up">↑</button>
-                  <button onClick={() => move(i, 1)} disabled={busy || i === clips.length - 1} aria-label="Move down">↓</button>
-                  <button onClick={() => remove(clip.id)} disabled={busy} aria-label="Remove">✕</button>
-                </span>
-              </li>
-            ))}
+            {clips.map((clip, i) => {
+              const overflow =
+                perClip && clip.status === 'ready' && clip.voiceover?.status === 'ready'
+                  ? clip.voiceover.buffer.duration - clip.info.duration
+                  : 0;
+              return (
+                <li key={clip.id} className={`clip ${clip.status}`}>
+                  <div className="clip-row">
+                    <span className="index">{i + 1}</span>
+                    <span className="name" title={clip.file.name}>
+                      {clip.file.name}
+                      {clip.status === 'error' && <small>{clip.error}</small>}
+                    </span>
+                    <span className="meta">
+                      {clip.status === 'probing' && 'Reading…'}
+                      {clip.status === 'ready' &&
+                        `${clip.info.width}×${clip.info.height} · ${Math.round(clip.info.fps)} fps · ${formatTime(clip.info.duration)}`}
+                    </span>
+                    <span className="actions">
+                      <button onClick={() => move(i, -1)} disabled={busy || i === 0} aria-label="Move up">↑</button>
+                      <button onClick={() => move(i, 1)} disabled={busy || i === clips.length - 1} aria-label="Move down">↓</button>
+                      <button onClick={() => remove(clip.id)} disabled={busy} aria-label="Remove">✕</button>
+                    </span>
+                  </div>
+
+                  {clip.status === 'ready' && (
+                    <div className="clip-extras">
+                      {perClip && (
+                        <>
+                          <AudioPicker
+                            label="Voiceover"
+                            track={clip.voiceover}
+                            disabled={busy}
+                            onFile={(file) => addVoiceover(file, clip.id)}
+                            onRemove={() => update(clip.id, { voiceover: null })}
+                          />
+                          {overflow > 0.5 && (
+                            <p className="hint warn">
+                              This voiceover is {formatTime(overflow)} longer than the clip and will be cut at the end.
+                            </p>
+                          )}
+                        </>
+                      )}
+
+                      <label className="toggle">
+                        <input
+                          type="checkbox"
+                          checked={clip.pill.enabled}
+                          disabled={busy}
+                          onChange={(e) => updatePill(clip, { enabled: e.target.checked })}
+                        />
+                        Add a text pill that explains this clip
+                      </label>
+
+                      {clip.pill.enabled && (
+                        <input
+                          className="text"
+                          type="text"
+                          placeholder="e.g. Fresh dough, made every morning"
+                          maxLength={PILL_MAX_LENGTH}
+                          value={clip.pill.text}
+                          disabled={busy}
+                          autoFocus
+                          onChange={(e) => updatePill(clip, { text: e.target.value })}
+                        />
+                      )}
+
+                      {clip.pill.enabled && clip.pill.text.trim() && (
+                        <PositionPicker
+                          value={clip.pill.position}
+                          aspect={aspect}
+                          disabled={busy}
+                          onChange={(position) => updatePill(clip, { position })}
+                        />
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
             <li className="clip fixed">
-              <span className="index">★</span>
-              <span className="name">Logo outro</span>
-              <span className="meta">{logoSeconds}s</span>
+              <div className="clip-row">
+                <span className="index">★</span>
+                <span className="name">Logo outro</span>
+                <span className="meta">{logoSeconds}s</span>
+              </div>
             </li>
           </ol>
 
@@ -314,34 +462,37 @@ export default function App() {
               </div>
               <VolumeSlider value={clipVolume} onChange={setClipVolume} disabled={busy} />
             </div>
-            <AudioSlot
-              label="Voiceover"
-              hint="Starts with the first clip"
-              track={voiceover}
-              volume={voiceVolume}
-              disabled={busy}
-              onFile={(file) => {
-                setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
-                void addAudio(file, setVoiceover);
-              }}
-              onRemove={() => setVoiceover(null)}
-              onVolume={setVoiceVolume}
-            />
-            <AudioSlot
-              label="Music"
-              hint="Plays under the whole video, loops and fades out"
-              track={music}
-              volume={musicVolume}
-              disabled={busy}
-              onFile={(file) => void addAudio(file, setMusic)}
-              onRemove={() => setMusic(null)}
-              onVolume={setMusicVolume}
-            />
-            {voiceOverflow > 0.5 && (
-              <p className="hint warn">
-                The voiceover is {formatTime(voiceOverflow)} longer than the video and will be cut at the end.
-              </p>
-            )}
+
+            <div className="slot">
+              <div className="slot-head">
+                <strong>Voiceover</strong>
+                <span className="muted">{perClip ? 'Add a file to each clip above' : 'Starts with the first clip'}</span>
+              </div>
+              {!perClip && (
+                <AudioPicker
+                  label="Voiceover"
+                  track={voiceover}
+                  disabled={busy}
+                  onFile={(file) => addVoiceover(file)}
+                  onRemove={() => setVoiceover(null)}
+                />
+              )}
+              {hasAnyVoice && <VolumeSlider value={voiceVolume} onChange={setVoiceVolume} disabled={busy} />}
+              {voiceOverflow > 0.5 && (
+                <p className="hint warn">
+                  The voiceover is {formatTime(voiceOverflow)} longer than the video and will be cut at the end.
+                </p>
+              )}
+            </div>
+
+            <div className="slot">
+              <div className="slot-head">
+                <strong>Music</strong>
+                <span className="muted">Plays under the whole video, loops and fades out</span>
+              </div>
+              <AudioPicker label="Music" track={music} disabled={busy} onFile={addMusic} onRemove={() => setMusic(null)} />
+              {music?.status === 'ready' && <VolumeSlider value={musicVolume} onChange={setMusicVolume} disabled={busy} />}
+            </div>
           </div>
 
           <div className="settings">
@@ -376,9 +527,7 @@ export default function App() {
               Export MP4
             </button>
           )}
-          {(clips.some((c) => c.status === 'error') || [voiceover, music].some((t) => t?.status === 'error')) && (
-            <p className="hint error">Remove the files marked in red to export.</p>
-          )}
+          {hasError && <p className="hint error">Remove the files marked in red to export.</p>}
         </section>
       )}
 

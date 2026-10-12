@@ -28,26 +28,40 @@ const MAX_LONG_EDGE = 3840;
 const MUSIC_FADE_IN = 1;
 const MUSIC_FADE_OUT = 2.5;
 const VOICE_FADE_OUT = 0.4;
+const CLIP_VOICE_FADE_OUT = 0.3;
+const PILL_FADE = 0.4;
 
 export type ClipInfo = { width: number; height: number; duration: number; fps: number };
 
 export type Size = { width: number; height: number };
 
-/** A decoded voiceover or music file with its volume (0–1). */
-export type AudioLayer = { buffer: AudioBuffer; volume: number };
+export type PillPosition = `${'top' | 'middle' | 'bottom'}-${'left' | 'center' | 'right'}`;
+
+/** A caption shown in a rounded box over one clip. */
+export type TextPill = { text: string; position: PillPosition };
+
+export type RenderClip = {
+  file: File;
+  info: ClipInfo;
+  /** Plays from the start of this clip and is cut at its end. */
+  voiceover?: AudioBuffer;
+  pill?: TextPill;
+};
 
 export type RenderOptions = {
-  clips: { file: File; info: ClipInfo }[];
+  clips: RenderClip[];
   logo: ImageBitmap;
   size: Size;
   fps: number;
   logoSeconds: number;
-  /** Volume of the clips' own sound (0–1). */
+  /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
-  /** Starts with the first clip and plays once. */
-  voiceover?: AudioLayer;
+  voiceVolume: number;
+  musicVolume: number;
+  /** One voiceover for the whole video: starts with the first clip and plays once. */
+  voiceover?: AudioBuffer;
   /** Plays under the whole video, looping if shorter, with fades at both ends. */
-  music?: AudioLayer;
+  music?: AudioBuffer;
   signal: AbortSignal;
   onProgress: (fraction: number) => void;
 };
@@ -183,13 +197,69 @@ const LIMITER_CURVE = (() => {
   return curve;
 })();
 
+/** Splits text into lines that fit `maxWidth` with the current canvas font. */
+const wrapText = (ctx: OffscreenCanvasRenderingContext2D, text: string, maxWidth: number) => {
+  const lines: string[] = [];
+  let line = '';
+  for (const word of text.split(/\s+/)) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(candidate).width > maxWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+};
+
+/** Lays out a text pill once and returns a function that draws it at a given opacity. */
+const createPill = (ctx: OffscreenCanvasRenderingContext2D, { text, position }: TextPill, width: number, height: number) => {
+  const base = Math.min(width, height);
+  const fontSize = Math.round(base * 0.042);
+  const font = `600 ${fontSize}px system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif`;
+  const padX = fontSize * 0.9;
+  const padY = fontSize * 0.55;
+  const lineHeight = fontSize * 1.3;
+  const margin = base * 0.06;
+
+  ctx.font = font;
+  const lines = wrapText(ctx, text.trim(), width * 0.8 - padX * 2);
+  const boxW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2;
+  const boxH = lines.length * lineHeight + padY * 2;
+  const radius = Math.min(boxH / 2, fontSize * 1.1);
+
+  const [vertical, horizontal] = position.split('-');
+  const x = horizontal === 'left' ? margin : horizontal === 'right' ? width - margin - boxW : (width - boxW) / 2;
+  const y = vertical === 'top' ? margin : vertical === 'bottom' ? height - margin - boxH : (height - boxH) / 2;
+  const align: CanvasTextAlign = horizontal === 'left' ? 'left' : horizontal === 'right' ? 'right' : 'center';
+  const textX = align === 'left' ? x + padX : align === 'right' ? x + boxW - padX : x + boxW / 2;
+
+  return (alpha: number) => {
+    if (alpha <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgba(15, 17, 21, 0.72)';
+    ctx.beginPath();
+    ctx.roundRect(x, y, boxW, boxH, radius);
+    ctx.fill();
+    ctx.font = font;
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    lines.forEach((line, i) => ctx.fillText(line, textX, y + padY + lineHeight * (i + 0.5)));
+    ctx.restore();
+  };
+};
+
 /**
  * Renders: logo intro → every clip in order → logo outro, into one constant-frame-rate MP4,
- * mixed with an optional voiceover and background music.
+ * with optional text pills, voiceovers (whole-video or per clip) and background music.
  * Decoding and encoding run on the GPU/media engine through WebCodecs; nothing is uploaded.
  */
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
-  const { clips, logo, size, fps, logoSeconds, clipVolume, voiceover, music, signal, onProgress } = options;
+  const { clips, logo, size, fps, logoSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } = options;
   const { width, height } = size;
 
   const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: QUALITY_VERY_HIGH });
@@ -219,11 +289,6 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
 
   const totalSeconds = totalFrames / fps;
   const voiceStart = logoFrames / fps;
-  const voiceEnvelope: Envelope = [
-    [0, 1],
-    [Math.max(0, totalSeconds - VOICE_FADE_OUT), 1],
-    [totalSeconds, 0],
-  ];
   const musicFadeOutStart = Math.max(MUSIC_FADE_IN, totalSeconds - MUSIC_FADE_OUT);
   const musicEnvelope: Envelope = [
     [0, 0],
@@ -231,7 +296,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     [musicFadeOutStart, 1],
     [Math.max(musicFadeOutStart, totalSeconds), 0],
   ];
-  const useLimiter = Boolean(voiceover || music);
+  const useLimiter = Boolean(voiceover || music || clips.some((c) => c.voiceover));
 
   let frameIndex = 0;
   let audioWritten = 0;
@@ -244,10 +309,35 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     onProgress(frameIndex / totalFrames);
   };
 
-  type ClipAudio = { reader: ClipAudioReader; startSample: number };
+  /** A clip's place on the timeline and the audio that belongs to it. */
+  type Segment = { start: number; end: number; startSample: number; reader?: ClipAudioReader; voiceover?: AudioBuffer };
 
-  /** Mixes clip sound, voiceover and music for one window of the timeline. */
-  const mixWindow = async (fromSample: number, frames: number, clip?: ClipAudio): Promise<AudioBuffer> => {
+  /** Plays `buffer` from `start`, fading out just before `end`, within the window [from, to). */
+  const scheduleVoice = (
+    context: OfflineAudioContext,
+    bus: AudioNode,
+    buffer: AudioBuffer,
+    start: number,
+    end: number,
+    fade: number,
+    from: number,
+    to: number,
+  ) => {
+    if (voiceVolume <= 0 || start >= to || Math.min(end, start + buffer.duration) <= from) return;
+    const envelope: Envelope = [
+      [start, 1],
+      [Math.max(start, end - fade), 1],
+      [end, 0],
+    ];
+    const source = new AudioBufferSourceNode(context, { buffer });
+    const gain = new GainNode(context);
+    applyEnvelope(gain.gain, envelope, from, to, voiceVolume);
+    source.connect(gain).connect(bus);
+    source.start(Math.max(0, start - from), Math.max(0, from - start));
+  };
+
+  /** Mixes clip sound, voiceovers and music for one window of the timeline. */
+  const mixWindow = async (fromSample: number, frames: number, segment?: Segment): Promise<AudioBuffer> => {
     const from = fromSample / SAMPLE_RATE;
     const to = from + frames / SAMPLE_RATE;
     const context = new OfflineAudioContext(CHANNELS, frames, SAMPLE_RATE);
@@ -261,38 +351,35 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       bus.connect(limiter);
     }
 
-    if (clip) {
+    if (segment?.reader) {
       const gain = new GainNode(context, { gain: clipVolume });
       gain.connect(bus);
-      const offset = clip.startSample / SAMPLE_RATE;
-      await clip.reader.schedule(context, gain, from - offset, to - offset);
+      const offset = segment.startSample / SAMPLE_RATE;
+      await segment.reader.schedule(context, gain, from - offset, to - offset);
     }
-
-    if (voiceover && voiceover.volume > 0 && voiceStart < to && voiceStart + voiceover.buffer.duration > from) {
-      const source = new AudioBufferSourceNode(context, { buffer: voiceover.buffer });
-      const gain = new GainNode(context);
-      applyEnvelope(gain.gain, voiceEnvelope, from, to, voiceover.volume);
-      source.connect(gain).connect(bus);
-      source.start(Math.max(0, voiceStart - from), Math.max(0, from - voiceStart));
+    if (segment?.voiceover) {
+      scheduleVoice(context, bus, segment.voiceover, segment.start, segment.end, CLIP_VOICE_FADE_OUT, from, to);
     }
-
-    if (music && music.volume > 0) {
-      const source = new AudioBufferSourceNode(context, { buffer: music.buffer, loop: true });
+    if (voiceover) {
+      scheduleVoice(context, bus, voiceover, voiceStart, totalSeconds, VOICE_FADE_OUT, from, to);
+    }
+    if (music && musicVolume > 0) {
+      const source = new AudioBufferSourceNode(context, { buffer: music, loop: true });
       const gain = new GainNode(context);
-      applyEnvelope(gain.gain, musicEnvelope, from, to, music.volume);
+      applyEnvelope(gain.gain, musicEnvelope, from, to, musicVolume);
       source.connect(gain).connect(bus);
-      source.start(0, from % music.buffer.duration);
+      source.start(0, from % music.duration);
     }
 
     return context.startRendering();
   };
 
   /** Encodes audio up to the current video position. */
-  const syncAudio = async (clip?: ClipAudio) => {
+  const syncAudio = async (segment?: Segment) => {
     const target = Math.round((frameIndex * SAMPLE_RATE) / fps);
     const frames = target - audioWritten;
     if (frames <= 0) return;
-    await audioSource.add(await mixWindow(audioWritten, frames, clip));
+    await audioSource.add(await mixWindow(audioWritten, frames, segment));
     audioWritten = target;
   };
 
@@ -315,19 +402,26 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     await syncAudio();
   };
 
-  const renderClip = async (file: File, frames: number) => {
+  const renderClip = async ({ file, voiceover: clipVoice, pill }: RenderClip, frames: number) => {
     const input = openInput(file);
-    let clipAudio: ClipAudio | undefined;
     let canvases: AsyncGenerator<{ canvas: HTMLCanvasElement | OffscreenCanvas } | null, void, unknown> | null = null;
+    const segment: Segment = {
+      start: frameIndex / fps,
+      end: (frameIndex + frames) / fps,
+      startSample: audioWritten,
+      voiceover: clipVoice,
+    };
     try {
       const videoTrack = (await input.getPrimaryVideoTrack())!;
       const audioTrack = await input.getPrimaryAudioTrack();
       const origin = await input.getFirstTimestamp();
 
       if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
-        const reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
-        clipAudio = { reader, startSample: audioWritten };
+        segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
       }
+
+      const drawPill = pill?.text.trim() ? createPill(ctx, pill, width, height) : null;
+      const pillFadeFrames = Math.max(1, Math.min(Math.round(PILL_FADE * fps), Math.floor(frames / 3)));
 
       // Letterboxed to the output size; rotation metadata is applied by the sink.
       const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
@@ -342,13 +436,14 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
         ctx.fillStyle = '#000000';
         ctx.fillRect(0, 0, width, height);
         if (!next.done && next.value) ctx.drawImage(next.value.canvas, 0, 0);
+        drawPill?.(Math.min(1, i / pillFadeFrames, (frames - 1 - i) / pillFadeFrames));
         await addVideoFrame();
-        if ((i + 1) % audioChunkFrames === 0) await syncAudio(clipAudio);
+        if ((i + 1) % audioChunkFrames === 0) await syncAudio(segment);
       }
-      await syncAudio(clipAudio);
+      await syncAudio(segment);
     } finally {
       void canvases?.return();
-      clipAudio?.reader.close();
+      segment.reader?.close();
       input.dispose();
     }
   };
@@ -356,7 +451,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   try {
     await output.start();
     await renderLogo();
-    for (let i = 0; i < clips.length; i++) await renderClip(clips[i].file, clipFrames[i]);
+    for (let i = 0; i < clips.length; i++) await renderClip(clips[i], clipFrames[i]);
     await renderLogo();
     await output.finalize();
     return new Blob([output.target.buffer!], { type: 'video/mp4' });
