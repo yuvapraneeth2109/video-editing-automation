@@ -17,6 +17,8 @@ import {
   Input,
   Mp4OutputFormat,
   Output,
+  StreamTarget,
+  type StreamTargetChunk,
   type WrappedAudioBuffer,
 } from 'mediabunny';
 
@@ -60,8 +62,8 @@ export type TextPill = {
 export type RenderClip = {
   file: File;
   info: ClipInfo;
-  /** Set for photos: shown still for `info.duration` seconds instead of decoding video. */
-  still?: ImageBitmap;
+  /** True for photos: shown still for `info.duration` seconds instead of decoding video. */
+  photo: boolean;
   motion: Motion;
   /** Transition into the next clip (ignored on the last clip). */
   transition: Transition;
@@ -69,7 +71,7 @@ export type RenderClip = {
   voiceover?: AudioBuffer;
   pill?: TextPill;
   /** Images shown over this clip (later ones on top), each fitted inside the grid cells it covers. */
-  images: { bitmap: ImageBitmap; cells: number[] }[];
+  images: { file: File; cells: number[] }[];
 };
 
 export type RenderOptions = {
@@ -118,6 +120,80 @@ export async function probeClip(file: File): Promise<ClipInfo> {
     throw new Error(error instanceof Error ? error.message : 'Unsupported file.');
   } finally {
     input.dispose();
+  }
+}
+
+/** Overlay images are decoded at most this large on their long edge — sharp even at 4K, far less memory. */
+const OVERLAY_MAX_EDGE = 2048;
+
+/** Decodes an image, scaled down to `maxEdge` if it is larger. Callers must close() the result. */
+async function decodeImage(file: File, maxEdge: number): Promise<ImageBitmap> {
+  const full = await createImageBitmap(file);
+  const scale = maxEdge / Math.max(full.width, full.height);
+  if (scale >= 1) return full;
+  const resized = await createImageBitmap(full, {
+    resizeWidth: Math.round(full.width * scale),
+    resizeHeight: Math.round(full.height * scale),
+    resizeQuality: 'high',
+  });
+  full.close();
+  return resized;
+}
+
+/**
+ * Checks an image can be read and returns its size. Nothing is kept in memory: images are
+ * decoded again only while their clip is being exported, so projects can hold any number of photos.
+ */
+export async function probeImage(file: File): Promise<Size> {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const size = { width: bitmap.width, height: bitmap.height };
+    bitmap.close();
+    return size;
+  } catch {
+    throw new Error('This image could not be read. Use PNG, JPG or WebP.');
+  }
+}
+
+/**
+ * Finished exports are streamed into the browser's private on-disk storage (Origin Private File System)
+ * instead of being held in memory, so the output can be many gigabytes. One export is kept at a time.
+ */
+const EXPORT_FILE = 'export.mp4';
+
+/** Deletes the stored export, freeing its disk space. */
+export async function clearExports() {
+  try {
+    const dir = await navigator.storage.getDirectory();
+    await dir.removeEntry(EXPORT_FILE);
+  } catch {
+    // Nothing stored, or on-disk storage is unavailable.
+  }
+}
+
+/** Where the MP4 is written: on disk when the browser allows it, otherwise in memory. */
+async function createTarget() {
+  try {
+    await clearExports();
+    const dir = await navigator.storage.getDirectory();
+    const handle = await dir.getFileHandle(EXPORT_FILE, { create: true });
+    const writable = (await handle.createWritable()) as unknown as WritableStream<StreamTargetChunk>;
+    return {
+      target: new StreamTarget(writable, { chunked: true }),
+      // Space for the index is reserved at the start, so the file streams/plays instantly without buffering it all.
+      fastStart: 'reserve' as const,
+      // A disk-backed Blob: previewing and downloading read from disk, not memory.
+      result: async () => new Blob([await handle.getFile()], { type: 'video/mp4' }),
+      discard: clearExports,
+    };
+  } catch {
+    const target = new BufferTarget();
+    return {
+      target,
+      fastStart: 'in-memory' as const,
+      result: async () => new Blob([target.buffer!], { type: 'video/mp4' }),
+      discard: async () => {},
+    };
   }
 }
 
@@ -334,6 +410,19 @@ function clipEnvelope(start: number, end: number, fadeIn: number, fadeOut: numbe
  * Decoding and encoding run on the GPU/media engine through WebCodecs; nothing is uploaded.
  */
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
+  try {
+    return await render(options);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+      throw new Error(
+        'Not enough free disk space for this export. Free up space on your computer, or choose a smaller output size or lower quality.',
+      );
+    }
+    throw error;
+  }
+}
+
+async function render(options: RenderOptions): Promise<Blob> {
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
   const { width, height } = size;
@@ -354,12 +443,6 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   const ctx = canvas.getContext('2d', { alpha: false })!;
   ctx.imageSmoothingQuality = 'high';
 
-  const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
-  const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: videoBitrate, keyFrameInterval: 2 });
-  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
-  output.addVideoTrack(videoSource, { frameRate: fps });
-  output.addAudioTrack(audioSource);
-
   // Plan every frame up front so progress is exact and transitions and fades land precisely.
   const plan = planTimeline(
     clips.map((c) => c.info.duration),
@@ -369,6 +452,16 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     transitionSeconds,
   );
   const { logoFrames, totalFrames } = plan;
+
+  // Exact packet counts let the muxer reserve the index up front (fast start without buffering in memory).
+  // Audio packets are 960 (Opus) or 1024 (AAC) samples; the smaller size gives the safe upper bound.
+  const audioPackets = Math.ceil(((totalFrames / fps) * SAMPLE_RATE) / 960);
+  const sink = await createTarget();
+  const output = new Output({ format: new Mp4OutputFormat({ fastStart: sink.fastStart }), target: sink.target });
+  const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: videoBitrate, keyFrameInterval: 2 });
+  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
+  output.addVideoTrack(videoSource, { frameRate: fps, maximumPacketCount: totalFrames + 16 });
+  output.addAudioTrack(audioSource, { maximumPacketCount: Math.ceil(audioPackets * 1.1) + 16 });
   const clipsEnd = totalFrames - logoFrames;
   const audioChunkFrames = Math.max(1, Math.round(AUDIO_CHUNK_SECONDS * fps));
 
@@ -492,9 +585,9 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     await syncAudio();
   };
 
-  /** Opens a clip for sequential frame reading and registers its audio for mixing. */
-  /** A still photo, letterboxed onto an output-sized canvas once and reused for every frame. */
-  const stillSource = (bitmap: ImageBitmap) => {
+  /** A photo, decoded at output size, letterboxed onto a canvas once and reused for every frame. */
+  const stillSource = async (file: File) => {
+    const bitmap = await decodeImage(file, Math.max(width, height));
     const still = new OffscreenCanvas(width, height);
     const g = still.getContext('2d', { alpha: false })!;
     g.imageSmoothingQuality = 'high';
@@ -502,6 +595,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     g.fillRect(0, 0, width, height);
     const s = Math.min(width / bitmap.width, height / bitmap.height);
     g.drawImage(bitmap, (width - bitmap.width * s) / 2, (height - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
+    bitmap.close();
     return { next: async () => still, close: () => {} };
   };
 
@@ -545,11 +639,15 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
       voiceover: clip.voiceover,
     };
-    const source = clip.still ? stillSource(clip.still) : await videoFileSource(clip.file, planned.frames, segment);
+    const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment);
     activeSegments.add(segment);
 
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
-    const drawImages = clip.images.map(({ bitmap, cells }) => createImageOverlay(ctx, bitmap, cells, width, height));
+    // Overlay images are decoded only while their clip is on screen, then released.
+    const overlays = await Promise.all(
+      clip.images.map(async ({ file, cells }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), cells })),
+    );
+    const drawImages = overlays.map(({ bitmap, cells }) => createImageOverlay(ctx, bitmap, cells, width, height));
     const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
     let k = 0;
 
@@ -584,6 +682,7 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
       },
       close() {
         source.close();
+        overlays.forEach(({ bitmap }) => bitmap.close());
         activeSegments.delete(segment);
       },
     };
@@ -629,9 +728,10 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
     await renderLogo();
     onProgress(1, 'Finishing file');
     await output.finalize();
-    return new Blob([output.target.buffer!], { type: 'video/mp4' });
+    return await sink.result();
   } catch (error) {
     if (output.state !== 'finalized' && output.state !== 'canceled') await output.cancel().catch(() => {});
+    await sink.discard();
     throw error;
   }
 }

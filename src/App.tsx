@@ -36,7 +36,7 @@ type Pill = { enabled: boolean; text: string; position: PillPosition } & PillSty
 /** An image overlay: decoded once when chosen; `url` previews it in the placement grid. */
 type Overlay = { id: string; file: File; url: string; cells: number[] } & (
   | { status: 'loading' }
-  | { status: 'ready'; bitmap: ImageBitmap }
+  | { status: 'ready'; width: number; height: number }
   | { status: 'error'; error: string }
 );
 
@@ -50,8 +50,8 @@ type Clip = {
   transition: Transition;
 } & (
   | { status: 'probing' }
-  /** `still` is set for photos; their `info.duration` is the on-screen time the user chose. */
-  | { status: 'ready'; info: ClipInfo; still?: ImageBitmap }
+  /** For photos, `info.duration` is the on-screen time the user chose. */
+  | { status: 'ready'; info: ClipInfo; photo: boolean }
   | { status: 'error'; error: string }
 );
 
@@ -83,10 +83,6 @@ const SIZE_GROUPS: [string, string[]][] = [
 ];
 const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
-/** Large photos are scaled down to this on their long edge — plenty for 4K output, far less memory. */
-const IMAGE_MAX_EDGE = 2048;
-/** Photos used as clips fill the whole frame, so they keep up to 4K detail. */
-const STILL_MAX_EDGE = 3840;
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
 const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
 const isVideo = (f: File) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name);
@@ -98,25 +94,8 @@ const CORNERS = [
   [GRID * (GRID - 2), GRID * (GRID - 2) + 1, GRID * (GRID - 1), GRID * (GRID - 1) + 1],
 ];
 
-/** Releases an overlay's preview URL and decoded pixels. */
-const freeOverlay = (overlay: Overlay) => {
-  URL.revokeObjectURL(overlay.url);
-  if (overlay.status === 'ready') overlay.bitmap.close();
-};
-
-/** Decodes an image file, scaled down if it is larger than needed. */
-async function decodeImage(file: File, maxEdge = IMAGE_MAX_EDGE): Promise<ImageBitmap> {
-  const full = await createImageBitmap(file);
-  const scale = maxEdge / Math.max(full.width, full.height);
-  if (scale >= 1) return full;
-  const resized = await createImageBitmap(full, {
-    resizeWidth: Math.round(full.width * scale),
-    resizeHeight: Math.round(full.height * scale),
-    resizeQuality: 'high',
-  });
-  full.close();
-  return resized;
-}
+/** Releases an overlay's preview URL. Pixels are only decoded during export, so nothing else is held. */
+const freeOverlay = (overlay: Overlay) => URL.revokeObjectURL(overlay.url);
 
 /** '#rrggbb' + 0–100 opacity → CSS rgba(). */
 const toRgba = (hex: string, opacity: number) => {
@@ -378,8 +357,6 @@ export default function App() {
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  const clipsRef = useRef(clips);
-  clipsRef.current = clips;
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
@@ -412,7 +389,8 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', warn);
   }, [busy]);
   useEffect(() => () => void (job.state === 'done' && URL.revokeObjectURL(job.url)), [job]);
-  useEffect(() => void loadEngine(), []);
+  // Load the engine early, and remove export files left on disk by an earlier visit.
+  useEffect(() => void loadEngine().then(({ clearExports }) => clearExports()), []);
 
   // A 1-second clock while exporting keeps the time-left estimate and the stall check current.
   const [now, setNow] = useState(() => performance.now());
@@ -439,21 +417,14 @@ export default function App() {
     setClips((prev) => [...prev, ...added]);
     setJob({ state: 'idle' });
 
-    const { probeClip } = await loadEngine();
+    const { probeClip, probeImage } = await loadEngine();
     for (const clip of added) {
-      const probe = isPhoto(clip.file)
-        ? decodeImage(clip.file, STILL_MAX_EDGE).then(
-            (still) => {
-              // If the photo was removed while decoding, release it instead of storing it.
-              if (!clipsRef.current.some((c) => c.id === clip.id)) still.close();
-              const info = { width: still.width, height: still.height, duration: PHOTO_SECONDS.default, fps: NaN };
-              return { info, still };
-            },
-            () => Promise.reject(new Error('This photo could not be read. Use PNG, JPG or WebP.')),
-          )
-        : probeClip(clip.file).then((info) => ({ info }));
+      const photo = isPhoto(clip.file);
+      const probe = photo
+        ? probeImage(clip.file).then(({ width, height }) => ({ width, height, duration: PHOTO_SECONDS.default, fps: NaN }))
+        : probeClip(clip.file);
       probe.then(
-        (result) => update(clip.id, { status: 'ready', ...result }),
+        (info) => update(clip.id, { status: 'ready', info, photo }),
         (e: Error) => update(clip.id, { status: 'error', error: e.message }),
       );
     }
@@ -463,11 +434,8 @@ export default function App() {
   const setPhotoSeconds = (clip: Clip & { status: 'ready' }, seconds: number) =>
     update(clip.id, { info: { ...clip.info, duration: Math.min(PHOTO_SECONDS.max, Math.max(PHOTO_SECONDS.min, seconds || PHOTO_SECONDS.min)) } });
 
-  /** Releases everything a clip holds in memory. */
-  const freeClip = (clip: Clip) => {
-    clip.images.forEach(freeOverlay);
-    if (clip.status === 'ready') clip.still?.close();
-  };
+  /** Releases the preview URLs a clip holds. */
+  const freeClip = (clip: Clip) => clip.images.forEach(freeOverlay);
 
   const update = (id: string, patch: Partial<Clip>) =>
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
@@ -487,7 +455,7 @@ export default function App() {
     update(clip.id, { images: clip.images.filter((o) => o !== overlay) });
   };
 
-  /** Adds images to a clip, each starting in the next free corner, and decodes them in the background. */
+  /** Adds images to a clip, each starting in the next free corner, and checks they can be read. */
   const addImages = (clip: Clip, files: File[]) => {
     const added: Overlay[] = files.map((file, i) => ({
       id: crypto.randomUUID(),
@@ -497,16 +465,14 @@ export default function App() {
       status: 'loading',
     }));
     update(clip.id, { images: [...clip.images, ...added] });
-    for (const overlay of added) {
-      decodeImage(overlay.file).then(
-        (bitmap) => {
-          // If the image was removed while decoding, release it instead of storing it.
-          if (!clipsRef.current.some((c) => c.images.some((o) => o.id === overlay.id))) bitmap.close();
-          else updateImage(clip.id, overlay.id, { status: 'ready', bitmap });
-        },
-        () => updateImage(clip.id, overlay.id, { status: 'error', error: 'This image could not be read.' }),
-      );
-    }
+    void loadEngine().then(({ probeImage }) => {
+      for (const overlay of added) {
+        probeImage(overlay.file).then(
+          (size) => updateImage(clip.id, overlay.id, { status: 'ready', ...size }),
+          (e: Error) => updateImage(clip.id, overlay.id, { status: 'error', error: e.message }),
+        );
+      }
+    });
   };
 
   /** Copies one pill's colours and font to every clip's pill and to clips added later. */
@@ -571,20 +537,23 @@ export default function App() {
     abortRef.current = controller;
     const startedAt = performance.now();
     setJob({ state: 'rendering', progress: 0, stage: 'Preparing', startedAt, updatedAt: startedAt });
+    let wakeLock: WakeLockSentinel | null | undefined = null;
 
     try {
       const { renderVideo } = await loadEngine();
+      // Keep the screen (and so the computer) awake during long exports.
+      wakeLock = await navigator.wakeLock?.request('screen').catch(() => null);
       const logo = await createImageBitmap(await (await fetch(logoUrl)).blob());
       let lastPaint = 0;
-      const blob = await renderVideo({
+      const result = await renderVideo({
         clips: ready.map((c) => ({
           file: c.file,
           info: c.info,
-          still: c.still,
+          photo: c.photo,
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
-          images: c.images.flatMap((o) => (o.status === 'ready' && o.cells.length ? [{ bitmap: o.bitmap, cells: o.cells }] : [])),
+          images: c.images.flatMap((o) => (o.status === 'ready' && o.cells.length ? [{ file: o.file, cells: o.cells }] : [])),
           pill:
             c.pill.enabled && c.pill.text.trim()
               ? {
@@ -616,17 +585,19 @@ export default function App() {
         },
       });
       logo.close();
-      setJob({ state: 'done', url: URL.createObjectURL(blob), size: blob.size, seconds: (performance.now() - startedAt) / 1000 });
+      setJob({ state: 'done', url: URL.createObjectURL(result), size: result.size, seconds: (performance.now() - startedAt) / 1000 });
     } catch (e) {
       console.error('Export failed', e);
       if (controller.signal.aborted) setJob({ state: 'idle' });
       else setJob({ state: 'error', message: e instanceof Error ? e.message : 'Export failed.' });
     } finally {
       abortRef.current = null;
+      void wakeLock?.release();
     }
   };
 
   const reset = () => {
+    void loadEngine().then(({ clearExports }) => clearExports());
     clips.forEach(freeClip);
     setClips([]);
     setVoiceover(null);
@@ -722,9 +693,9 @@ export default function App() {
                     </span>
                     <span className="meta">
                       {clip.status === 'probing' && 'Reading…'}
-                      {clip.status === 'ready' && !clip.still &&
+                      {clip.status === 'ready' && !clip.photo &&
                         `${clip.info.width}×${clip.info.height} · ${Math.round(clip.info.fps)} fps · ${formatTime(clip.info.duration)}`}
-                      {clip.status === 'ready' && clip.still && (
+                      {clip.status === 'ready' && clip.photo && (
                         <span className="photo-meta">
                           Photo · {clip.info.width}×{clip.info.height} ·
                           <input
@@ -788,7 +759,7 @@ export default function App() {
                           {overflow > 0.5 && (
                             <p className="hint warn">
                               This voiceover is {formatTime(overflow)} longer than the clip and will be cut at the end.
-                              {clip.status === 'ready' && clip.still && (
+                              {clip.status === 'ready' && clip.photo && (
                                 <>
                                   {' '}
                                   <button
@@ -857,7 +828,7 @@ export default function App() {
                               </span>
                               <span className="meta">
                                 {overlay.status === 'loading' && 'Reading…'}
-                                {overlay.status === 'ready' && `${overlay.bitmap.width}×${overlay.bitmap.height}`}
+                                {overlay.status === 'ready' && `${overlay.width}×${overlay.height}`}
                               </span>
                               <span className="actions">
                                 <button onClick={() => removeImage(clip, overlay)} disabled={busy} aria-label="Remove image">✕</button>

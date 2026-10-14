@@ -12,7 +12,7 @@ Browser (Chrome / Edge / Safari)
  ├─ WebCodecs decodes frames on the GPU media engine
  ├─ Each frame is letterboxed onto one canvas at the output size and frame rate, with zoom, transitions and text pills composited on top
  ├─ Clip sound, voiceover and music are mixed (Web Audio) at 48 kHz stereo, in sync with the video
- └─ WebCodecs encodes H.264 + AAC → MP4 (fast-start) → download
+ └─ WebCodecs encodes H.264 + AAC → MP4 streamed to on-disk browser storage (OPFS) → preview / download
 ```
 
 | Decision | Why |
@@ -29,6 +29,9 @@ Browser (Chrome / Edge / Safari)
 | Timeline planned on an exact frame grid (`timeline.ts`) shared by UI and engine | Durations shown in the UI match the export; overlapping transitions shorten the video exactly as previewed |
 | Overlapping clips decoded side by side, audio crossfaded with the picture | Dissolve/slide/wipe look and sound seamless |
 | Default output 1080p at up to 30 fps | Phone footage is often 4K60 — 1080p30 is ~8× fewer pixels to encode, so exports are much faster |
+| Export streamed to the Origin Private File System, with the MP4 index reserved up front (`fastStart: 'reserve'`) | Output size is limited by free disk space, not RAM; files stay fast-start; falls back to in-memory where OPFS is unavailable |
+| Input videos read lazily from disk (`BlobSource`); photos and overlay images decoded only while their clip is on screen | Memory stays flat no matter how large or how many the inputs are |
+| Screen wake lock during export | Long exports don't stop because the computer went to sleep |
 | Media engine lazy-loaded | Page paints instantly; engine loads in the background |
 
 ## Project structure
