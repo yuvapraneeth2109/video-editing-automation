@@ -116,7 +116,7 @@ const PILL_POSITIONS: PillPosition[] = [
   'bottom-left', 'bottom-center', 'bottom-right',
 ];
 /** If progress stops moving for this long, the export is flagged as stuck. */
-const STALL_SECONDS = 45;
+const STALL_SECONDS = 60;
 const SUPPORTED = typeof VideoEncoder !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
 
 const formatTime = (s: number) => {
@@ -537,14 +537,15 @@ export default function App() {
     abortRef.current = controller;
     const startedAt = performance.now();
     setJob({ state: 'rendering', progress: 0, stage: 'Preparing', startedAt, updatedAt: startedAt });
-    let wakeLock: WakeLockSentinel | null | undefined = null;
+    const wakeLock: { current?: WakeLockSentinel } = {};
 
     try {
       const { renderVideo } = await loadEngine();
-      // Keep the screen (and so the computer) awake during long exports.
-      wakeLock = await navigator.wakeLock?.request('screen').catch(() => null);
+      // Keep the screen (and so the computer) awake during long exports. Not awaited: never delays the export.
+      navigator.wakeLock?.request('screen').then((lock) => (wakeLock.current = lock), () => {});
       const logo = await createImageBitmap(await (await fetch(logoUrl)).blob());
       let lastPaint = 0;
+      let lastStage = '';
       const result = await renderVideo({
         clips: ready.map((c) => ({
           file: c.file,
@@ -579,8 +580,10 @@ export default function App() {
         signal: controller.signal,
         onProgress: (progress, stage) => {
           const now = performance.now();
-          if (now - lastPaint < 100 && progress < 1) return; // throttle re-renders
+          // Throttle re-renders, but always show a new step immediately.
+          if (now - lastPaint < 100 && progress < 1 && stage === lastStage) return;
           lastPaint = now;
+          lastStage = stage;
           setJob({ state: 'rendering', progress, stage, startedAt, updatedAt: now });
         },
       });
@@ -592,7 +595,7 @@ export default function App() {
       else setJob({ state: 'error', message: e instanceof Error ? e.message : 'Export failed.' });
     } finally {
       abortRef.current = null;
-      void wakeLock?.release();
+      void wakeLock.current?.release();
     }
   };
 
@@ -1032,8 +1035,8 @@ export default function App() {
           )}
           {stalled && job.state === 'rendering' && (
             <p className="hint warn">
-              No progress for {STALL_SECONDS} seconds on “{job.stage}”. This file may be too heavy for this browser. Press Cancel,
-              then try “1080p” output and “Up to 30 fps”, or re-export that clip from your phone and add it again.
+              No progress for {STALL_SECONDS} seconds on “{job.stage}”. Press Cancel, then try a 720p output size, or remove
+              the clip named above and add it again after re-saving it from your phone.
             </p>
           )}
           {hasError && <p className="hint error">Remove the files marked in red to export.</p>}

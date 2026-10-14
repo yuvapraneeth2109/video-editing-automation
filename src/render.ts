@@ -171,13 +171,37 @@ export async function clearExports() {
   }
 }
 
+/** A step that takes longer than this without finishing is treated as stuck. */
+const STALL_MS = 20_000;
+
+/** Thrown when an encoder or the output file stops responding. */
+class StallError extends Error {}
+
+/**
+ * Rejects with a StallError if `promise` has not settled within `ms`, or with the abort reason as soon as
+ * `signal` fires — so Cancel works immediately even while an encoder is stuck.
+ */
+function withTimeout<T>(promise: Promise<T>, what: string, ms = STALL_MS, signal?: AbortSignal): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new StallError(`${what} stopped responding`)), ms);
+    onAbort = () => reject(signal!.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([promise, guard]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort!);
+  });
+}
+
 /** Where the MP4 is written: on disk when the browser allows it, otherwise in memory. */
 async function createTarget() {
   try {
-    await clearExports();
-    const dir = await navigator.storage.getDirectory();
-    const handle = await dir.getFileHandle(EXPORT_FILE, { create: true });
-    const writable = (await handle.createWritable()) as unknown as WritableStream<StreamTargetChunk>;
+    await withTimeout(clearExports(), 'Disk storage', 10_000);
+    const dir = await withTimeout(navigator.storage.getDirectory(), 'Disk storage', 10_000);
+    const handle = await withTimeout(dir.getFileHandle(EXPORT_FILE, { create: true }), 'Disk storage', 10_000);
+    const writable = (await withTimeout(handle.createWritable(), 'Disk storage', 10_000)) as unknown as WritableStream<StreamTargetChunk>;
     return {
       target: new StreamTarget(writable, { chunked: true }),
       // Space for the index is reserved at the start, so the file streams/plays instantly without buffering it all.
@@ -411,7 +435,22 @@ function clipEnvelope(start: number, end: number, fadeIn: number, fadeOut: numbe
  */
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
   try {
-    return await render(options);
+    try {
+      return await render(options, false);
+    } catch (error) {
+      if (!(error instanceof StallError) || options.signal.aborted) throw error;
+      // Some devices' hardware encoders (or their AAC audio encoder) never return frames. Start again with
+      // software video encoding and Opus audio, which behave the same everywhere.
+      console.warn(`${error.message}; retrying with compatible encoder settings.`);
+      try {
+        return await render(options, true);
+      } catch (retryError) {
+        if (retryError instanceof StallError) {
+          throw new Error(`${retryError.message}, even in compatibility mode. Please update Chrome and try again, or choose a smaller output size.`);
+        }
+        throw retryError;
+      }
+    }
   } catch (error) {
     if (error instanceof DOMException && error.name === 'QuotaExceededError') {
       throw new Error(
@@ -422,17 +461,27 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   }
 }
 
-async function render(options: RenderOptions): Promise<Blob> {
+/** `compatible` = the retry profile: software video encoding and Opus audio first. */
+async function render(options: RenderOptions, compatible: boolean): Promise<Blob> {
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
   const { width, height } = size;
-  let stage = 'Preparing';
-  onProgress(0, stage);
+  let progress = 0;
+  let stage = '';
+  /** Names the current step in the UI, so a slow or stuck export always shows where it is. */
+  const setStage = (name: string) => {
+    stage = compatible ? `${name} (compatibility mode)` : name;
+    onProgress(progress, stage);
+  };
+  setStage('Checking encoders');
 
   const videoBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
-  const videoCodec = await getFirstEncodableVideoCodec(['avc', 'hevc'], { width, height, bitrate: videoBitrate });
+  const software = { hardwareAcceleration: 'prefer-software' as const };
+  const videoCodecOptions = { width, height, bitrate: videoBitrate };
+  const softwareVideo = compatible && (await getFirstEncodableVideoCodec(['avc'], { ...videoCodecOptions, ...software })) === 'avc';
+  const videoCodec = softwareVideo ? 'avc' : await getFirstEncodableVideoCodec(['avc', 'hevc'], videoCodecOptions);
   if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
-  const audioCodec = await getFirstEncodableAudioCodec(['aac', 'opus'], {
+  const audioCodec = await getFirstEncodableAudioCodec(compatible ? ['opus', 'aac'] : ['aac', 'opus'], {
     numberOfChannels: CHANNELS,
     sampleRate: SAMPLE_RATE,
     bitrate: QUALITY_VERY_HIGH,
@@ -456,9 +505,15 @@ async function render(options: RenderOptions): Promise<Blob> {
   // Exact packet counts let the muxer reserve the index up front (fast start without buffering in memory).
   // Audio packets are 960 (Opus) or 1024 (AAC) samples; the smaller size gives the safe upper bound.
   const audioPackets = Math.ceil(((totalFrames / fps) * SAMPLE_RATE) / 960);
+  setStage('Preparing output file');
   const sink = await createTarget();
   const output = new Output({ format: new Mp4OutputFormat({ fastStart: sink.fastStart }), target: sink.target });
-  const videoSource = new CanvasSource(canvas, { codec: videoCodec, bitrate: videoBitrate, keyFrameInterval: 2 });
+  const videoSource = new CanvasSource(canvas, {
+    codec: videoCodec,
+    bitrate: videoBitrate,
+    keyFrameInterval: 2,
+    ...(softwareVideo ? software : {}),
+  });
   const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
   output.addVideoTrack(videoSource, { frameRate: fps, maximumPacketCount: totalFrames + 16 });
   output.addAudioTrack(audioSource, { maximumPacketCount: Math.ceil(audioPackets * 1.1) + 16 });
@@ -482,9 +537,10 @@ async function render(options: RenderOptions): Promise<Blob> {
   // Timestamps derive from the global frame index, so video and audio can never drift apart.
   const addVideoFrame = async () => {
     signal.throwIfAborted();
-    await videoSource.add(frameIndex / fps, 1 / fps);
+    await withTimeout(videoSource.add(frameIndex / fps, 1 / fps), 'The video encoder', STALL_MS, signal);
     frameIndex++;
-    onProgress(frameIndex / totalFrames, stage);
+    progress = frameIndex / totalFrames;
+    onProgress(progress, stage);
   };
 
   /** A clip's span on the timeline (seconds) and the audio that belongs to it. */
@@ -562,7 +618,7 @@ async function render(options: RenderOptions): Promise<Blob> {
     const target = Math.round((frameIndex * SAMPLE_RATE) / fps);
     const frames = target - audioWritten;
     if (frames <= 0) return;
-    await audioSource.add(await mixWindow(audioWritten, frames));
+    await withTimeout(audioSource.add(await mixWindow(audioWritten, frames)), `The ${audioCodec.toUpperCase()} audio encoder`, STALL_MS, signal);
     audioWritten = target;
   };
 
@@ -697,7 +753,7 @@ async function render(options: RenderOptions): Promise<Blob> {
     try {
       for (let f = logoFrames; f < clipsEnd; f++) {
         while (nextClip < clips.length && plan.clips[nextClip].start === f) {
-          stage = `Clip ${nextClip + 1} of ${clips.length}`;
+          setStage(`Clip ${nextClip + 1} of ${clips.length}`);
           open.push(await openClip(clips[nextClip], plan.clips[nextClip]));
           nextClip++;
         }
@@ -720,18 +776,22 @@ async function render(options: RenderOptions): Promise<Blob> {
   };
 
   try {
-    await output.start();
-    stage = 'Logo intro';
+    setStage('Starting encoders');
+    await withTimeout(output.start(), 'The output file');
+    setStage('Logo intro');
     await renderLogo();
     await renderClips();
-    stage = 'Logo outro';
+    setStage('Logo outro');
     await renderLogo();
-    onProgress(1, 'Finishing file');
-    await output.finalize();
+    setStage('Finishing file');
+    await withTimeout(output.finalize(), 'Finishing the file', 120_000);
     return await sink.result();
   } catch (error) {
-    if (output.state !== 'finalized' && output.state !== 'canceled') await output.cancel().catch(() => {});
-    await sink.discard();
+    // A stuck encoder can also block cancelling, so neither clean-up step may wait forever.
+    if (output.state !== 'finalized' && output.state !== 'canceled') {
+      await withTimeout(output.cancel(), 'Cancelling', 5_000).catch(() => {});
+    }
+    await withTimeout(sink.discard(), 'Clean-up', 5_000).catch(() => {});
     throw error;
   }
 }
