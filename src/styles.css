@@ -237,6 +237,7 @@ h3 { margin: 4px 0 0; font-size: 15px; }
 .volume { display: grid; grid-template-columns: auto 1fr 44px; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
 .volume input { width: 100%; accent-color: var(--blue); }
 .volume .meta { text-align: right; }
+.hint.muted { margin: 0; font-size: 13px; }
 .hint.warn { margin: 0; color: var(--orange); font-size: 13px; }
 
 @media (max-width: 560px) {

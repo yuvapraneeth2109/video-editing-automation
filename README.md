@@ -31,6 +31,8 @@ Browser (Chrome / Edge / Safari)
 | Default output 1080p at up to 30 fps | Phone footage is often 4K60 — 1080p30 is ~8× fewer pixels to encode, so exports are much faster |
 | Export streamed to the Origin Private File System, with the MP4 index reserved up front (`fastStart: 'reserve'`) | Output size is limited by free disk space, not RAM; files stay fast-start; falls back to in-memory where OPFS is unavailable |
 | Input videos read lazily from disk (`BlobSource`); photos and overlay images decoded only while their clip is on screen | Memory stays flat no matter how large or how many the inputs are |
+| Encoder watchdog: a step that returns nothing for 20 s triggers one automatic retry with a compatible profile (realtime encoding, software video where offered, in-memory output) | Some devices' encoders hold frames back indefinitely; the export recovers instead of hanging |
+| Safari/iOS (WebKit) use the compatible profile from the start | WebKit's encoder can wait for more frames than the pipeline sends, and its on-disk writer is new; realtime mode returns every frame immediately |
 | Screen wake lock during export | Long exports don't stop because the computer went to sleep |
 | Media engine lazy-loaded | Page paints instantly; engine loads in the background |
 

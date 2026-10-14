@@ -117,6 +117,8 @@ const PILL_POSITIONS: PillPosition[] = [
 ];
 /** If progress stops moving for this long, the export is flagged as stuck. */
 const STALL_SECONDS = 60;
+/** Safari and all iOS browsers share the WebKit engine. */
+const IS_SAFARI = navigator.vendor === 'Apple Computer, Inc.';
 const SUPPORTED = typeof VideoEncoder !== 'undefined' && typeof OffscreenCanvas !== 'undefined';
 
 const formatTime = (s: number) => {
@@ -1037,6 +1039,11 @@ export default function App() {
             <p className="hint warn">
               No progress for {STALL_SECONDS} seconds on “{job.stage}”. Press Cancel, then try a 720p output size, or remove
               the clip named above and add it again after re-saving it from your phone.
+            </p>
+          )}
+          {IS_SAFARI && (
+            <p className="hint muted">
+              Safari keeps the finished video in memory. For very long videos, export in Chrome or Edge.
             </p>
           )}
           {hasError && <p className="hint error">Remove the files marked in red to export.</p>}

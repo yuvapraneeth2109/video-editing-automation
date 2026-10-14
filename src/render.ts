@@ -195,9 +195,17 @@ function withTimeout<T>(promise: Promise<T>, what: string, ms = STALL_MS, signal
   });
 }
 
-/** Where the MP4 is written: on disk when the browser allows it, otherwise in memory. */
-async function createTarget() {
+/**
+ * Safari and every iOS browser (all WebKit). Their encoders can hold frames back while the encoding
+ * pipeline waits for them to be released, and their on-disk storage writer is new, so they use the
+ * compatible profile from the start.
+ */
+const IS_WEBKIT = typeof navigator !== 'undefined' && navigator.vendor === 'Apple Computer, Inc.';
+
+/** Where the MP4 is written: on disk when allowed (`useDisk`) and supported, otherwise in memory. */
+async function createTarget(useDisk: boolean) {
   try {
+    if (!useDisk) throw new Error('In-memory output requested');
     await withTimeout(clearExports(), 'Disk storage', 10_000);
     const dir = await withTimeout(navigator.storage.getDirectory(), 'Disk storage', 10_000);
     const handle = await withTimeout(dir.getFileHandle(EXPORT_FILE, { create: true }), 'Disk storage', 10_000);
@@ -436,11 +444,13 @@ function clipEnvelope(start: number, end: number, fadeIn: number, fadeOut: numbe
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
   try {
     try {
-      return await render(options, false);
+      return await render(options, IS_WEBKIT);
     } catch (error) {
       if (!(error instanceof StallError) || options.signal.aborted) throw error;
-      // Some devices' hardware encoders (or their AAC audio encoder) never return frames. Start again with
-      // software video encoding and Opus audio, which behave the same everywhere.
+      if (IS_WEBKIT) {
+        throw new Error(`${error.message} in Safari. Please export in Chrome or Edge, which handle long videos best.`);
+      }
+      // Some devices' encoders never return frames. Start again with the compatible profile.
       console.warn(`${error.message}; retrying with compatible encoder settings.`);
       try {
         return await render(options, true);
@@ -461,7 +471,10 @@ export async function renderVideo(options: RenderOptions): Promise<Blob> {
   }
 }
 
-/** `compatible` = the retry profile: software video encoding and Opus audio first. */
+/**
+ * `compatible` = the safe profile: realtime encoding (the encoder returns every frame immediately instead of
+ * holding frames to look ahead), software video encoding where offered, and in-memory output.
+ */
 async function render(options: RenderOptions, compatible: boolean): Promise<Blob> {
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
@@ -470,18 +483,19 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   let stage = '';
   /** Names the current step in the UI, so a slow or stuck export always shows where it is. */
   const setStage = (name: string) => {
-    stage = compatible ? `${name} (compatibility mode)` : name;
+    stage = compatible && !IS_WEBKIT ? `${name} (compatibility mode)` : name;
     onProgress(progress, stage);
   };
   setStage('Checking encoders');
 
   const videoBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
-  const software = { hardwareAcceleration: 'prefer-software' as const };
+  const software = { hardwareAcceleration: 'prefer-software' as const, latencyMode: 'realtime' as const };
   const videoCodecOptions = { width, height, bitrate: videoBitrate };
   const softwareVideo = compatible && (await getFirstEncodableVideoCodec(['avc'], { ...videoCodecOptions, ...software })) === 'avc';
   const videoCodec = softwareVideo ? 'avc' : await getFirstEncodableVideoCodec(['avc', 'hevc'], videoCodecOptions);
   if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
-  const audioCodec = await getFirstEncodableAudioCodec(compatible ? ['opus', 'aac'] : ['aac', 'opus'], {
+  // AAC plays everywhere, so it comes first, except on the Chrome retry, where the AAC encoder may be the stuck part.
+  const audioCodec = await getFirstEncodableAudioCodec(compatible && !IS_WEBKIT ? ['opus', 'aac'] : ['aac', 'opus'], {
     numberOfChannels: CHANNELS,
     sampleRate: SAMPLE_RATE,
     bitrate: QUALITY_VERY_HIGH,
@@ -506,13 +520,13 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   // Audio packets are 960 (Opus) or 1024 (AAC) samples; the smaller size gives the safe upper bound.
   const audioPackets = Math.ceil(((totalFrames / fps) * SAMPLE_RATE) / 960);
   setStage('Preparing output file');
-  const sink = await createTarget();
+  const sink = await createTarget(!compatible);
   const output = new Output({ format: new Mp4OutputFormat({ fastStart: sink.fastStart }), target: sink.target });
   const videoSource = new CanvasSource(canvas, {
     codec: videoCodec,
     bitrate: videoBitrate,
     keyFrameInterval: 2,
-    ...(softwareVideo ? software : {}),
+    ...(softwareVideo ? software : compatible ? { latencyMode: 'realtime' as const } : {}),
   });
   const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
   output.addVideoTrack(videoSource, { frameRate: fps, maximumPacketCount: totalFrames + 16 });
