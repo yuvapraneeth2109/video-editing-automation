@@ -143,15 +143,24 @@ button.link:disabled { opacity: 0.5; }
 }
 .frame button:hover { background: rgba(255, 255, 255, 0.08); }
 .frame button.selected { background: rgba(74, 143, 208, 0.25); }
-.frame-image {
-  position: absolute;
-  padding: 3px;
-  object-fit: contain;
-  pointer-events: none;
+/* Free image placement over the clip's first frame. */
+.placer {
+  position: relative;
+  width: 100%;
+  max-width: 420px;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: #1d2129;
+  background-size: cover;
+  background-position: center;
+  touch-action: none;
+  user-select: none;
+  cursor: grab;
 }
-.frame.large { height: 216px; touch-action: none; user-select: none; }
-.frame.large button { border-color: rgba(255, 255, 255, 0.1); }
-.frame-image.other { opacity: 0.35; }
+.placer:active { cursor: grabbing; }
+.place-img { position: absolute; object-fit: contain; pointer-events: none; }
+.place-img.other { opacity: 0.4; }
 .photo-meta { display: inline-flex; align-items: center; gap: 6px; }
 input.text.seconds { width: 64px; padding: 4px 6px; font-size: 13px; }
 .custom-size { display: flex; align-items: center; gap: 8px; color: var(--text); }
@@ -248,13 +257,6 @@ h3 { margin: 4px 0 0; font-size: 15px; }
 .thumb.placeholder { background: var(--border); }
 .image-item .slot-file { grid-template-columns: auto 1fr auto auto; }
 .image-item .thumb { width: 44px; height: 30px; }
-
-/* Export file-size cap + border customization. */
-.border-controls { display: grid; gap: 10px; }
-.border-preview-wrap { display: flex; justify-content: center; padding: 4px 0; }
-.border-preview { position: relative; border-radius: 8px; box-shadow: 0 0 0 1px var(--border); max-width: 100%; }
-.border-preview .inner { position: absolute; display: grid; place-items: center; background: #1d2129; border-radius: 4px; overflow: hidden; }
-.border-preview .inner img { max-width: 58%; max-height: 58%; object-fit: contain; }
 
 /* Voiceover ranges. */
 .ranges { display: grid; gap: 10px; }

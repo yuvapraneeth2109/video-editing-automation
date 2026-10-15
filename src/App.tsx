@@ -8,11 +8,9 @@ import {
   planTimeline,
   type ClipInfo,
   type Motion,
-  GRID,
   CUSTOM_SIZE_LIMITS,
   PILL_FONTS,
   QUALITY_LABELS,
-  cellBounds,
   customSize,
   type PillFont,
   type PillPosition,
@@ -33,8 +31,8 @@ type AudioTrack = { file: File } & (
 type PillStyle = { background: string; opacity: number; color: string; font: PillFont };
 type Pill = { enabled: boolean; text: string; position: PillPosition } & PillStyle;
 
-/** An image overlay: decoded once when chosen; `url` previews it in the placement grid. */
-type Overlay = { id: string; file: File; url: string; cells: number[] } & (
+/** An image overlay: `url` previews it; x/y are its centre (0–1 of the frame) and scale its width (0–1). */
+type Overlay = { id: string; file: File; url: string; x: number; y: number; scale: number } & (
   | { status: 'loading' }
   | { status: 'ready'; width: number; height: number }
   | { status: 'error'; error: string }
@@ -120,17 +118,14 @@ const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
 const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
 const isVideo = (f: File) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name);
-/** New images start in a free corner (2×2 boxes): top-right, top-left, bottom-right, bottom-left. */
-const CORNERS = [
-  [GRID - 2, GRID - 1, 2 * GRID - 2, 2 * GRID - 1],
-  [0, 1, GRID, GRID + 1],
-  [GRID * GRID - GRID - 2, GRID * GRID - GRID - 1, GRID * GRID - 2, GRID * GRID - 1],
-  [GRID * (GRID - 2), GRID * (GRID - 2) + 1, GRID * (GRID - 1), GRID * (GRID - 1) + 1],
+/** New images start near a free corner (centre position), at 25% of the frame width. */
+const IMAGE_SPOTS = [
+  { x: 0.75, y: 0.25 },
+  { x: 0.25, y: 0.25 },
+  { x: 0.75, y: 0.75 },
+  { x: 0.25, y: 0.75 },
 ];
-
-/** Default border: none. `fraction` is a share of the shorter output edge. */
-const DEFAULT_BORDER = { fraction: 0, color: '#ffffff' };
-const BORDER_MAX_PCT = 15;
+const IMAGE_DEFAULT_SCALE = 0.25;
 
 /** Releases a clip's preview URLs (its thumbnail and every overlay). Pixels are only decoded during export. */
 const freeOverlay = (overlay: Overlay) => URL.revokeObjectURL(overlay.url);
@@ -275,77 +270,77 @@ function PillStyleEditor({ pill, disabled, onChange, onApplyAll }: { pill: Pill;
   );
 }
 
-/** A miniature frame: click boxes to choose where the image goes; it fills the rectangle around them. */
-type ImagePlacementProps = { overlay: Overlay; others: Overlay[]; aspect: number; disabled: boolean; onChange: (cells: number[]) => void };
-
-/** Positions an image preview over the grid boxes it covers. */
-const areaStyle = (cells: number[]) => {
-  const { col, row, cols, rows } = cellBounds(cells);
-  return { left: `${(col / GRID) * 100}%`, top: `${(row / GRID) * 100}%`, width: `${(cols / GRID) * 100}%`, height: `${(rows / GRID) * 100}%` };
+/** The box an overlay occupies in the placement frame (in %), centred on its x/y. */
+const overlayBox = (o: Overlay, frameAspect: number) => {
+  const imgAspect = o.status === 'ready' ? o.width / o.height : 1;
+  return {
+    left: `${o.x * 100}%`,
+    top: `${o.y * 100}%`,
+    width: `${o.scale * 100}%`,
+    height: `${o.scale * (frameAspect / imgAspect) * 100}%`,
+    transform: 'translate(-50%, -50%)',
+  };
 };
 
-function ImagePlacement({ overlay, others, aspect, disabled, onChange }: ImagePlacementProps) {
-  const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
+type ImagePlacementProps = {
+  overlay: Overlay;
+  others: Overlay[];
+  background: string | null;
+  aspect: number;
+  disabled: boolean;
+  onChange: (patch: Partial<Pick<Overlay, 'x' | 'y' | 'scale'>>) => void;
+};
 
-  /** The grid box under the pointer, clamped to the frame. */
-  const cellAt = (e: React.PointerEvent<HTMLDivElement>) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    const clamp = (v: number) => Math.min(GRID - 1, Math.max(0, Math.floor(v * GRID)));
-    return clamp((e.clientY - r.top) / r.height) * GRID + clamp((e.clientX - r.left) / r.width);
-  };
-  /** Every box in the rectangle between two corner boxes. */
-  const rectangle = (a: number, b: number) => {
-    const { col, row, cols, rows } = cellBounds([a, b]);
-    return Array.from({ length: cols * rows }, (_, i) => (row + Math.floor(i / cols)) * GRID + col + (i % cols));
-  };
-  const toggle = (cell: number) =>
-    onChange(overlay.cells.includes(cell) ? overlay.cells.filter((c) => c !== cell) : [...overlay.cells, cell]);
+/** Drag the image over the clip's first frame to place it; a slider sets its size. */
+function ImagePlacement({ overlay, others, background, aspect, disabled, onChange }: ImagePlacementProps) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState(false);
 
-  const preview = drag ? rectangle(drag.from, drag.to) : null;
-  const shown = preview ?? overlay.cells;
+  const moveTo = (clientX: number, clientY: number) => {
+    const r = frameRef.current?.getBoundingClientRect();
+    if (!r) return;
+    onChange({
+      x: Math.min(1, Math.max(0, (clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (clientY - r.top) / r.height)),
+    });
+  };
 
   return (
     <div className="position">
-      <span className="muted">Placement and size — drag across the boxes the image should cover (or click boxes to add/remove)</span>
+      <span className="muted">Drag the image to place it over the first frame; use the slider to size it</span>
       <div
-        className="frame large"
-        style={{ aspectRatio: aspect, gridTemplate: `repeat(${GRID}, 1fr) / repeat(${GRID}, 1fr)` }}
+        ref={frameRef}
+        className="placer"
+        style={{ aspectRatio: aspect, backgroundImage: background ? `url(${background})` : undefined }}
         aria-label="Image placement"
         onPointerDown={(e) => {
           if (disabled || e.button !== 0) return;
           e.currentTarget.setPointerCapture(e.pointerId);
-          const cell = cellAt(e);
-          setDrag({ from: cell, to: cell });
+          setDragging(true);
+          moveTo(e.clientX, e.clientY);
         }}
-        onPointerMove={(e) => drag && setDrag({ ...drag, to: cellAt(e) })}
-        onPointerUp={() => {
-          if (!drag) return;
-          if (drag.from === drag.to) toggle(drag.from);
-          else onChange(rectangle(drag.from, drag.to));
-          setDrag(null);
-        }}
-        onPointerCancel={() => setDrag(null)}
+        onPointerMove={(e) => dragging && moveTo(e.clientX, e.clientY)}
+        onPointerUp={() => setDragging(false)}
+        onPointerCancel={() => setDragging(false)}
       >
-        {Array.from({ length: GRID * GRID }, (_, cell) => (
-          <button
-            key={cell}
-            tabIndex={0}
-            aria-pressed={overlay.cells.includes(cell)}
-            aria-label={`Box ${cell + 1}`}
-            className={shown.includes(cell) ? 'selected' : ''}
-            disabled={disabled}
-            // Pointer clicks are handled by the frame; this keeps Enter/Space working for keyboard users.
-            onClick={(e) => e.detail === 0 && toggle(cell)}
-          />
+        {others.map((o) => (
+          <img key={o.id} className="place-img other" src={o.url} alt="" style={overlayBox(o, aspect)} draggable={false} />
         ))}
-        {others
-          .filter((o) => o.cells.length)
-          .map((o) => (
-            <img key={o.id} className="frame-image other" src={o.url} alt="" style={areaStyle(o.cells)} />
-          ))}
-        {shown.length > 0 && <img className="frame-image" src={overlay.url} alt="" style={areaStyle(shown)} />}
+        <img className="place-img" src={overlay.url} alt="" style={overlayBox(overlay, aspect)} draggable={false} />
       </div>
-      {!overlay.cells.length && <p className="hint warn">Select at least one box, or this image won't be shown.</p>}
+      <label className="volume">
+        <span>Size</span>
+        <input
+          type="range"
+          min={5}
+          max={100}
+          step={1}
+          value={Math.round(overlay.scale * 100)}
+          disabled={disabled}
+          onChange={(e) => onChange({ scale: Number(e.target.value) / 100 })}
+        />
+        <span className="meta">{Math.round(overlay.scale * 100)}%</span>
+      </label>
     </div>
   );
 }
@@ -388,25 +383,6 @@ function PositionPicker({ value, aspect, disabled, onChange }: { value: PillPosi
   );
 }
 
-/** Shows the chosen border thickness and colour around a sample frame, so nothing is placed over it. */
-function BorderPreview({ aspect, border }: { aspect: number; border: { fraction: number; color: string } }) {
-  const maxW = 260;
-  const maxH = 150;
-  const heightBound = maxW / maxH > aspect;
-  const w = heightBound ? maxH * aspect : maxW;
-  const h = heightBound ? maxH : maxW / aspect;
-  const inset = border.fraction * Math.min(w, h);
-  return (
-    <div className="border-preview-wrap">
-      <div className="border-preview" style={{ width: w, height: h, background: border.fraction > 0 ? border.color : 'transparent' }}>
-        <div className="inner" style={{ inset }}>
-          <img src={logoUrl} alt="" />
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
@@ -421,7 +397,6 @@ export default function App() {
   const [quality, setQuality] = useState<Quality>('very-high');
   const [sizeTarget, setSizeTarget] = useState<SizeTarget>('none');
   const [customMB, setCustomMB] = useState(2);
-  const [border, setBorder] = useState(DEFAULT_BORDER);
   const [logoSeconds, setLogoSeconds] = useState(3);
   const [fastFps, setFastFps] = useState(true);
   const [transitionSeconds, setTransitionSeconds] = useState(0.75);
@@ -559,7 +534,8 @@ export default function App() {
       id: crypto.randomUUID(),
       file,
       url: URL.createObjectURL(file),
-      cells: CORNERS[(clip.images.length + i) % CORNERS.length],
+      ...IMAGE_SPOTS[(clip.images.length + i) % IMAGE_SPOTS.length],
+      scale: IMAGE_DEFAULT_SCALE,
       status: 'loading',
     }));
     update(clip.id, { images: [...clip.images, ...added] });
@@ -666,7 +642,7 @@ export default function App() {
           motion: c.motion,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
-          images: c.images.flatMap((o) => (o.status === 'ready' && o.cells.length ? [{ file: o.file, cells: o.cells }] : [])),
+          images: c.images.flatMap((o) => (o.status === 'ready' ? [{ file: o.file, x: o.x, y: o.y, scale: o.scale }] : [])),
           pill:
             c.pill.enabled && c.pill.text.trim()
               ? {
@@ -685,7 +661,6 @@ export default function App() {
         transitionSeconds,
         quality,
         maxBytes,
-        border,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
@@ -974,9 +949,10 @@ export default function App() {
                               <ImagePlacement
                                 overlay={overlay}
                                 others={clip.images.filter((o) => o !== overlay)}
+                                background={clip.preview}
                                 aspect={aspect}
                                 disabled={busy}
-                                onChange={(cells) => updateImage(clip.id, overlay.id, { cells })}
+                                onChange={(patch) => updateImage(clip.id, overlay.id, patch)}
                               />
                             )}
                           </div>
@@ -1250,41 +1226,9 @@ export default function App() {
                 ? `A ${formatCap(maxBytes)} limit is very tight for a ${formatTime(totalSeconds)} video — the file may go slightly over, and quality will drop. Shorten the video or raise the limit.`
                 : capTight
                   ? `Fitting under ${formatCap(maxBytes)} needs about ${Math.round(estVideoBps / 1000)} kbps of video, so some quality is traded for the smaller file. Shorten the video or raise the limit for full quality.`
-                  : `Targets about ${Math.round(estVideoBps / 1000)} kbps to stay under ${formatCap(maxBytes)}${!IS_SAFARI ? ', using HEVC where your Mac supports it' : ''} — no visible quality loss expected at this length. Resolution is unchanged.`}
+                  : `Targets about ${Math.round(estVideoBps / 1000)} kbps to stay under ${formatCap(maxBytes)} — no visible quality loss expected at this length. Resolution is unchanged.`}
             </p>
           )}
-
-          <div className="border-controls">
-            <div className="settings">
-              <label>
-                Border thickness
-                <span className="color-row">
-                  <input
-                    type="range"
-                    min={0}
-                    max={BORDER_MAX_PCT}
-                    step={1}
-                    value={Math.round(border.fraction * 100)}
-                    disabled={busy}
-                    onChange={(e) => setBorder((b) => ({ ...b, fraction: Number(e.target.value) / 100 }))}
-                  />
-                  <span className="meta">
-                    {Math.round(border.fraction * 100)}%
-                    {outputSize && border.fraction > 0 && ` · ≈${Math.round(border.fraction * Math.min(outputSize.width, outputSize.height))}px`}
-                  </span>
-                </span>
-              </label>
-              <label>
-                Border colour
-                <span className="color-row">
-                  <input type="color" value={border.color} disabled={busy || border.fraction === 0} onChange={(e) => setBorder((b) => ({ ...b, color: e.target.value }))} />
-                  <span className="meta">{border.fraction === 0 ? 'No border' : border.color.toUpperCase()}</span>
-                </span>
-              </label>
-            </div>
-            <BorderPreview aspect={aspect} border={border} />
-            <span className="muted">Your clips, logo and images are fitted inside the border, so nothing is covered by it.</span>
-          </div>
 
           {job.state === 'rendering' ? (
             <div className="progress-row">

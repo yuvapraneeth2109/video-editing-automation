@@ -19,13 +19,10 @@ import {
   Output,
   StreamTarget,
   type StreamTargetChunk,
-  type VideoCodec,
   type WrappedAudioBuffer,
 } from 'mediabunny';
 
 import {
-  GRID,
-  cellBounds,
   planTimeline,
   type ClipInfo,
   type Motion,
@@ -72,6 +69,9 @@ export type TextPill = {
   fontFamily: string;
 };
 
+/** Where and how large an overlay image sits: x/y are its centre (0–1 of the frame), scale its width (0–1). */
+export type ImagePlacement = { x: number; y: number; scale: number };
+
 export type RenderClip = {
   file: File;
   info: ClipInfo;
@@ -83,12 +83,9 @@ export type RenderClip = {
   /** Plays from the start of this clip and is cut at its end. */
   voiceover?: AudioBuffer;
   pill?: TextPill;
-  /** Images shown over this clip (later ones on top), each fitted inside the grid cells it covers. */
-  images: { file: File; cells: number[] }[];
+  /** Images shown over this clip (later ones on top), each at its own position and size. */
+  images: ({ file: File } & ImagePlacement)[];
 };
-
-/** A frame drawn around the whole video; content is fitted inside it so nothing touches the edge. */
-export type Border = { fraction: number; color: string };
 
 /** One voiceover that spans a run of clips, by their position in `clips` (inclusive). */
 export type VoiceRange = { buffer: AudioBuffer; start: number; end: number };
@@ -103,8 +100,6 @@ export type RenderOptions = {
   quality: Quality;
   /** When set, the output is encoded to stay under this many bytes (resolution unchanged). */
   maxBytes?: number;
-  /** A coloured frame around the video; `fraction` 0 = none. */
-  border: Border;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
@@ -181,11 +176,12 @@ export async function probeImage(file: File): Promise<Size> {
 }
 
 /** Longest edge of a clip/image thumbnail, in pixels. Small, so many clips stay light. */
-const THUMBNAIL_MAX_EDGE = 240;
+const THUMBNAIL_MAX_EDGE = 320;
 
 /**
- * Builds a small still preview for a clip and returns an object URL (JPEG, so it shows in every browser).
+ * Builds a still preview for a clip and returns an object URL (JPEG, so it shows in every browser).
  * Callers own the URL and must revokeObjectURL it. A photo uses its own pixels; a video uses its first frame.
+ * The same preview doubles as the backdrop for placing overlay images.
  */
 export async function makeThumbnail(file: File, photo: boolean): Promise<string> {
   if (photo) {
@@ -193,7 +189,7 @@ export async function makeThumbnail(file: File, photo: boolean): Promise<string>
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
     canvas.getContext('2d', { alpha: false })!.drawImage(bitmap, 0, 0);
     bitmap.close();
-    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 }));
+    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 }));
   }
   const input = openInput(file);
   try {
@@ -215,7 +211,7 @@ export async function makeThumbnail(file: File, photo: boolean): Promise<string>
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, tw, th);
     ctx.drawImage(first.value.canvas, 0, 0);
-    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 }));
+    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 }));
   } finally {
     input.dispose();
   }
@@ -442,20 +438,24 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, widt
   };
 };
 
-/** Fits an image (keeping its proportions) inside the grid cells it covers; returns a draw-at-opacity function. */
-const createImageOverlay = (ctx: OffscreenCanvasRenderingContext2D, bitmap: ImageBitmap, cells: number[], width: number, height: number) => {
-  const { col, row, cols, rows } = cellBounds(cells);
-  const inset = Math.min(width, height) * 0.02;
-  const areaW = (cols * width) / GRID - inset * 2;
-  const areaH = (rows * height) / GRID - inset * 2;
-  const scale = Math.min(areaW / bitmap.width, areaH / bitmap.height);
-  const w = bitmap.width * scale;
-  const h = bitmap.height * scale;
-  const x = (col * width) / GRID + inset + (areaW - w) / 2;
-  const y = (row * height) / GRID + inset + (areaH - h) / 2;
+/**
+ * Draws an overlay image at its chosen centre and width, keeping its proportions.
+ * x/y are the image centre as a fraction of the frame; scale is its width as a fraction of the frame width.
+ */
+const createImageOverlay = (
+  ctx: OffscreenCanvasRenderingContext2D,
+  bitmap: ImageBitmap,
+  place: ImagePlacement,
+  width: number,
+  height: number,
+) => {
+  const w = clamp01(place.scale) * width;
+  const h = w * (bitmap.height / bitmap.width);
+  const x = place.x * width - w / 2;
+  const y = place.y * height - h / 2;
 
   return (alpha: number) => {
-    if (alpha <= 0) return;
+    if (alpha <= 0 || w <= 0) return;
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.drawImage(bitmap, x, y, w, h);
@@ -505,7 +505,7 @@ function clipEnvelope(start: number, end: number, fadeIn: number, fadeOut: numbe
 
 /**
  * Renders: logo intro → every clip in order (with transitions, zoom, text pills) → logo outro,
- * into one constant-frame-rate MP4, mixed with clip sound, voiceovers and background music.
+ * into one constant-frame-rate H.264 MP4, mixed with clip sound, voiceovers and background music.
  * Decoding and encoding run on the GPU/media engine through WebCodecs; nothing is uploaded.
  */
 export async function renderVideo(options: RenderOptions): Promise<Blob> {
@@ -566,7 +566,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const { logoFrames, totalFrames } = plan;
   const totalSeconds = totalFrames / fps;
 
-  // Pick the video bitrate: either a quality preset, or the exact rate that fits the chosen file-size cap.
+  // Pick the video bitrate: either a quality preset (no quality loss), or the exact rate that fits the size cap.
   const qualityBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
   const capped = typeof options.maxBytes === 'number' && options.maxBytes > 0;
   const audioBitrate = capped ? CAP_AUDIO_BITRATE : QUALITY_VERY_HIGH;
@@ -580,11 +580,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const software = { hardwareAcceleration: 'prefer-software' as const, latencyMode: 'realtime' as const };
   const videoCodecOptions = { width, height, bitrate: videoBitrate };
   const softwareVideo = compatible && (await getFirstEncodableVideoCodec(['avc'], { ...videoCodecOptions, ...software })) === 'avc';
-  // With a size cap, HEVC fits more picture into the same bytes — so prefer it (except on the Safari/software paths,
-  // which stay on AVC for reliability). Otherwise AVC first, for the widest playback.
-  const preferHevc = capped && !compatible && !IS_WEBKIT;
-  const codecOrder: VideoCodec[] = softwareVideo ? ['avc'] : preferHevc ? ['hevc', 'avc'] : ['avc', 'hevc'];
-  const videoCodec = softwareVideo ? 'avc' : await getFirstEncodableVideoCodec(codecOrder, videoCodecOptions);
+  // Always H.264 (AVC) inside the MP4 — the most widely compatible format, and never HEVC.
+  const videoCodec = await getFirstEncodableVideoCodec(['avc'], videoCodecOptions);
   if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
   // AAC plays everywhere, so it comes first, except on the Chrome retry, where the AAC encoder may be the stuck part.
   const audioCodec = await getFirstEncodableAudioCodec(compatible && !IS_WEBKIT ? ['opus', 'aac'] : ['aac', 'opus'], {
@@ -594,22 +591,9 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   });
   if (!audioCodec) throw new Error('This browser cannot encode audio for MP4.');
 
-  // The MP4 is always the full output size. A border, if any, frames a slightly smaller content area
-  // that everything (video, photos, logo, pills, images) is drawn into — so nothing touches the edge.
-  const borderPx = options.border.fraction > 0 ? Math.round(options.border.fraction * Math.min(width, height)) : 0;
-  const cw = borderPx > 0 ? toEven(width - 2 * borderPx) : width;
-  const ch = borderPx > 0 ? toEven(height - 2 * borderPx) : height;
-  const hasBorder = cw < width || ch < height;
-  const offX = Math.round((width - cw) / 2);
-  const offY = Math.round((height - ch) / 2);
-
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d', { alpha: false })!;
   ctx.imageSmoothingQuality = 'high';
-  // Content is drawn here (its own canvas when there's a border, otherwise straight onto the output canvas).
-  const frameCanvas = hasBorder ? new OffscreenCanvas(cw, ch) : canvas;
-  const cctx = hasBorder ? frameCanvas.getContext('2d', { alpha: false })! : ctx;
-  cctx.imageSmoothingQuality = 'high';
 
   // Exact packet counts let the muxer reserve the index up front (fast start without buffering in memory).
   // Audio packets are 960 (Opus) or 1024 (AAC) samples; the smaller size gives the safe upper bound.
@@ -658,12 +642,6 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   // Timestamps derive from the global frame index, so video and audio can never drift apart.
   const addVideoFrame = async () => {
     signal.throwIfAborted();
-    if (hasBorder) {
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = options.border.color;
-      ctx.fillRect(0, 0, width, height);
-      ctx.drawImage(frameCanvas, offX, offY);
-    }
     await withTimeout(videoSource.add(frameIndex / fps, 1 / fps), 'The video encoder', STALL_MS, signal);
     frameIndex++;
     progress = frameIndex / totalFrames;
@@ -754,33 +732,33 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 
   const renderLogo = async () => {
     const fadeFrames = Math.max(1, Math.min(Math.round(0.6 * fps), Math.floor(logoFrames / 3)));
-    const scale = Math.min((cw * 0.5) / logo.width, (ch * 0.45) / logo.height);
+    const scale = Math.min((width * 0.5) / logo.width, (height * 0.45) / logo.height);
     const w = logo.width * scale;
     const h = logo.height * scale;
 
     for (let i = 0; i < logoFrames; i++) {
-      cctx.globalAlpha = 1;
-      cctx.fillStyle = '#ffffff';
-      cctx.fillRect(0, 0, cw, ch);
-      cctx.globalAlpha = Math.min(1, i / fadeFrames, (logoFrames - 1 - i) / fadeFrames);
-      cctx.drawImage(logo, (cw - w) / 2, (ch - h) / 2, w, h);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.globalAlpha = Math.min(1, i / fadeFrames, (logoFrames - 1 - i) / fadeFrames);
+      ctx.drawImage(logo, (width - w) / 2, (height - h) / 2, w, h);
       await addVideoFrame();
       if ((i + 1) % audioChunkFrames === 0) await syncAudio();
     }
-    cctx.globalAlpha = 1;
+    ctx.globalAlpha = 1;
     await syncAudio();
   };
 
-  /** A photo, decoded at content size, letterboxed onto a canvas once and reused for every frame. */
+  /** A photo, decoded at output size, letterboxed onto a canvas once and reused for every frame. */
   const stillSource = async (file: File) => {
-    const bitmap = await decodeImage(file, Math.max(cw, ch));
-    const still = new OffscreenCanvas(cw, ch);
+    const bitmap = await decodeImage(file, Math.max(width, height));
+    const still = new OffscreenCanvas(width, height);
     const g = still.getContext('2d', { alpha: false })!;
     g.imageSmoothingQuality = 'high';
     g.fillStyle = '#000000';
-    g.fillRect(0, 0, cw, ch);
-    const s = Math.min(cw / bitmap.width, ch / bitmap.height);
-    g.drawImage(bitmap, (cw - bitmap.width * s) / 2, (ch - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
+    g.fillRect(0, 0, width, height);
+    const s = Math.min(width / bitmap.width, height / bitmap.height);
+    g.drawImage(bitmap, (width - bitmap.width * s) / 2, (height - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
     bitmap.close();
     return { next: async () => still, close: () => {} };
   };
@@ -794,7 +772,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
       segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
     }
-    const sink = new CanvasSink(videoTrack, { width: cw, height: ch, fit: 'contain', poolSize: 2 });
+    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
     const canvases = sink.canvasesAtTimestamps(
       (function* () {
         for (let i = 0; i < frames; i++) yield origin + i / fps;
@@ -828,38 +806,38 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment);
     activeSegments.add(segment);
 
-    const drawPill = clip.pill?.text.trim() ? createPill(cctx, clip.pill, cw, ch) : null;
+    const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
-      clip.images.map(async ({ file, cells }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), cells })),
+      clip.images.map(async ({ file, x, y, scale }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), place: { x, y, scale } })),
     );
-    const drawImages = overlays.map(({ bitmap, cells }) => createImageOverlay(cctx, bitmap, cells, cw, ch));
+    const drawImages = overlays.map(({ bitmap, place }) => createImageOverlay(ctx, bitmap, place, width, height));
     const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
     let k = 0;
 
     return {
-      /** Draws this clip's next frame onto the content canvas, applying transition and zoom. */
+      /** Draws this clip's next frame onto the output canvas, applying transition and zoom. */
       async draw() {
         const frame = await source.next();
         const { alpha, offsetX, reveal, scale } = layerAt(planned, clip.motion, k);
 
-        cctx.save();
-        cctx.globalAlpha = alpha;
-        cctx.translate(offsetX * cw, 0);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(offsetX * width, 0);
         if (reveal < 1) {
-          cctx.beginPath();
-          cctx.rect(0, 0, reveal * cw, ch);
-          cctx.clip();
+          ctx.beginPath();
+          ctx.rect(0, 0, reveal * width, height);
+          ctx.clip();
         }
         if (frame) {
-          const w = cw * scale;
-          const h = ch * scale;
-          cctx.drawImage(frame, (cw - w) / 2, (ch - h) / 2, w, h);
+          const w = width * scale;
+          const h = height * scale;
+          ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
         drawImages.forEach((draw) => draw(overlayAlpha));
         drawPill?.(overlayAlpha);
-        cctx.restore();
+        ctx.restore();
         k++;
       },
       /** True once every frame of this clip has been drawn. */
@@ -887,8 +865,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
           open.push(await openClip(clips[nextClip], plan.clips[nextClip]));
           nextClip++;
         }
-        cctx.fillStyle = '#000000';
-        cctx.fillRect(0, 0, cw, ch);
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, width, height);
         for (const clip of open) await clip.draw(); // older clip first, the incoming one on top
         await addVideoFrame();
 
