@@ -43,6 +43,8 @@ type Overlay = { id: string; file: File; url: string; cells: number[] } & (
 type Clip = {
   id: string;
   file: File;
+  /** A small still preview (object URL), filled in after the file is read. */
+  preview: string | null;
   voiceover: AudioTrack | null;
   pill: Pill;
   images: Overlay[];
@@ -55,7 +57,10 @@ type Clip = {
   | { status: 'error'; error: string }
 );
 
-type VoiceMode = 'whole' | 'per-clip';
+type VoiceMode = 'whole' | 'ranges' | 'per-clip';
+
+/** One voiceover file that covers a run of clips, by their position (inclusive). */
+type VoiceRange = { id: string; track: AudioTrack; start: number; end: number };
 
 type Job =
   | { state: 'idle' }
@@ -73,14 +78,43 @@ const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
   '4K landscape (3840×2160)': () => ({ width: 3840, height: 2160 }),
   '1080p portrait (1080×1920)': () => ({ width: 1080, height: 1920 }),
   '720p portrait (720×1280)': () => ({ width: 720, height: 1280 }),
-  '1080p square (1080×1080)': () => ({ width: 1080, height: 1080 }),
+  'Instagram square 1:1 (1080×1080)': () => ({ width: 1080, height: 1080 }),
+  'Instagram portrait 4:5 (1080×1350)': () => ({ width: 1080, height: 1350 }),
+  'Instagram story / Reel 9:16 (1080×1920)': () => ({ width: 1080, height: 1920 }),
+  'Ad video — 960×960 (required)': () => ({ width: 960, height: 960 }),
+  'Ad video — 1024×1024 (maximum)': () => ({ width: 1024, height: 1024 }),
 };
 const SIZE_GROUPS: [string, string[]][] = [
-  ['Match your clips', Object.keys(SIZE_PRESETS).slice(0, 3)],
+  ['Match your clips', ['1080p, shape of first clip (recommended)', '720p, shape of first clip (fastest)', 'Original size, up to 4K (slower)']],
   ['Custom', [CUSTOM_PRESET]],
-  ['Landscape', Object.keys(SIZE_PRESETS).slice(3, 6)],
-  ['Portrait & square', Object.keys(SIZE_PRESETS).slice(6)],
+  ['Landscape', ['1080p landscape (1920×1080)', '720p landscape (1280×720)', '4K landscape (3840×2160)']],
+  ['Portrait', ['1080p portrait (1080×1920)', '720p portrait (720×1280)']],
+  ['Instagram', ['Instagram square 1:1 (1080×1080)', 'Instagram portrait 4:5 (1080×1350)', 'Instagram story / Reel 9:16 (1080×1920)']],
+  ['Ad video (square)', ['Ad video — 960×960 (required)', 'Ad video — 1024×1024 (maximum)']],
 ];
+
+/** File-size cap: the compressor fits the whole video under this many bytes, resolution unchanged. */
+type SizeTarget = 'none' | 'mobile' | 'desktop' | 'custom';
+const MB = 1024 * 1024;
+const SIZE_TARGET_LABELS: Record<SizeTarget, string> = {
+  none: 'No limit — best quality',
+  mobile: 'Mobile video — max 2 MB',
+  desktop: 'Desktop video — max 5 MB',
+  custom: 'Custom maximum (MB)…',
+};
+/** Must match the engine's CAP_AUDIO_BITRATE, so the on-screen estimate matches the real file. */
+const AUDIO_BITRATE = 128_000;
+const targetBytes = (t: SizeTarget, customMB: number): number | undefined =>
+  t === 'mobile' ? 2 * MB : t === 'desktop' ? 5 * MB : t === 'custom' ? Math.max(0.2, customMB) * MB : undefined;
+
+/** The text-pill position grid: more boxes than before, mapped to normalised x/y for the engine. */
+const PILL_GRID = 5;
+const CENTER_BOTTOM: PillPosition = { x: 0.5, y: 1 };
+const gridPosition = (col: number, row: number): PillPosition => ({
+  x: PILL_GRID > 1 ? col / (PILL_GRID - 1) : 0.5,
+  y: PILL_GRID > 1 ? row / (PILL_GRID - 1) : 0.5,
+});
+
 const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
@@ -94,7 +128,11 @@ const CORNERS = [
   [GRID * (GRID - 2), GRID * (GRID - 2) + 1, GRID * (GRID - 1), GRID * (GRID - 1) + 1],
 ];
 
-/** Releases an overlay's preview URL. Pixels are only decoded during export, so nothing else is held. */
+/** Default border: none. `fraction` is a share of the shorter output edge. */
+const DEFAULT_BORDER = { fraction: 0, color: '#ffffff' };
+const BORDER_MAX_PCT = 15;
+
+/** Releases a clip's preview URLs (its thumbnail and every overlay). Pixels are only decoded during export. */
 const freeOverlay = (overlay: Overlay) => URL.revokeObjectURL(overlay.url);
 
 /** '#rrggbb' + 0–100 opacity → CSS rgba(). */
@@ -110,11 +148,6 @@ const LOGO_SECONDS = [2, 3, 4, 5];
 /** Clip sound is lowered to this when a voiceover is added, so the voice stays clear. */
 const CLIP_VOLUME_UNDER_VOICE = 30;
 const PILL_MAX_LENGTH = 120;
-const PILL_POSITIONS: PillPosition[] = [
-  'top-left', 'top-center', 'top-right',
-  'middle-left', 'middle-center', 'middle-right',
-  'bottom-left', 'bottom-center', 'bottom-right',
-];
 /** If progress stops moving for this long, the export is flagged as stuck. */
 const STALL_SECONDS = 60;
 /** Safari and all iOS browsers share the WebKit engine. */
@@ -126,6 +159,7 @@ const formatTime = (s: number) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 };
 const formatBytes = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`);
+const formatCap = (bytes: number) => `${Number.isInteger(bytes / MB) ? (bytes / MB).toFixed(0) : (bytes / MB).toFixed(1)} MB`;
 const readyBuffer = (track: AudioTrack | null) => (track?.status === 'ready' ? track.buffer : undefined);
 
 type AudioPickerProps = {
@@ -316,25 +350,58 @@ function ImagePlacement({ overlay, others, aspect, disabled, onChange }: ImagePl
   );
 }
 
-/** A miniature frame: click a cell to place the pill there. */
+/** A miniature frame: click a box to place the pill there. The grid is PILL_GRID×PILL_GRID. */
 function PositionPicker({ value, aspect, disabled, onChange }: { value: PillPosition; aspect: number; disabled: boolean; onChange: (p: PillPosition) => void }) {
+  const selected = (col: number, row: number) => {
+    const p = gridPosition(col, row);
+    return Math.abs(p.x - value.x) < 1e-6 && Math.abs(p.y - value.y) < 1e-6;
+  };
   return (
     <div className="position">
-      <span className="muted">Position</span>
-      <div className="frame" style={{ aspectRatio: aspect }} role="radiogroup" aria-label="Pill position">
-        {PILL_POSITIONS.map((p) => (
-          <button
-            key={p}
-            role="radio"
-            aria-checked={p === value}
-            aria-label={p.replace('-', ' ')}
-            className={p === value ? 'selected' : ''}
-            disabled={disabled}
-            onClick={() => onChange(p)}
-          >
-            {p === value && <span className="mini-pill" />}
-          </button>
-        ))}
+      <span className="muted">Position — tap a box ({PILL_GRID}×{PILL_GRID} grid)</span>
+      <div
+        className="frame"
+        style={{ aspectRatio: aspect, gridTemplate: `repeat(${PILL_GRID}, 1fr) / repeat(${PILL_GRID}, 1fr)` }}
+        role="radiogroup"
+        aria-label="Pill position"
+      >
+        {Array.from({ length: PILL_GRID * PILL_GRID }, (_, k) => {
+          const col = k % PILL_GRID;
+          const row = Math.floor(k / PILL_GRID);
+          const sel = selected(col, row);
+          return (
+            <button
+              key={k}
+              role="radio"
+              aria-checked={sel}
+              aria-label={`Row ${row + 1}, column ${col + 1}`}
+              className={sel ? 'selected' : ''}
+              disabled={disabled}
+              onClick={() => onChange(gridPosition(col, row))}
+            >
+              {sel && <span className="mini-pill" />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Shows the chosen border thickness and colour around a sample frame, so nothing is placed over it. */
+function BorderPreview({ aspect, border }: { aspect: number; border: { fraction: number; color: string } }) {
+  const maxW = 260;
+  const maxH = 150;
+  const heightBound = maxW / maxH > aspect;
+  const w = heightBound ? maxH * aspect : maxW;
+  const h = heightBound ? maxH : maxW / aspect;
+  const inset = border.fraction * Math.min(w, h);
+  return (
+    <div className="border-preview-wrap">
+      <div className="border-preview" style={{ width: w, height: h, background: border.fraction > 0 ? border.color : 'transparent' }}>
+        <div className="inner" style={{ inset }}>
+          <img src={logoUrl} alt="" />
+        </div>
       </div>
     </div>
   );
@@ -344,6 +411,7 @@ export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
   const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
+  const [ranges, setRanges] = useState<VoiceRange[]>([]);
   const [music, setMusic] = useState<AudioTrack | null>(null);
   const [clipVolume, setClipVolume] = useState(100);
   const [voiceVolume, setVoiceVolume] = useState(100);
@@ -351,6 +419,9 @@ export default function App() {
   const [preset, setPreset] = useState(Object.keys(SIZE_PRESETS)[0]);
   const [custom, setCustom] = useState<Size>({ width: 1920, height: 1080 });
   const [quality, setQuality] = useState<Quality>('very-high');
+  const [sizeTarget, setSizeTarget] = useState<SizeTarget>('none');
+  const [customMB, setCustomMB] = useState(2);
+  const [border, setBorder] = useState(DEFAULT_BORDER);
   const [logoSeconds, setLogoSeconds] = useState(3);
   const [fastFps, setFastFps] = useState(true);
   const [transitionSeconds, setTransitionSeconds] = useState(0.75);
@@ -363,7 +434,9 @@ export default function App() {
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
   const perClip = voiceMode === 'per-clip';
-  const activeTracks = [music, ...(perClip ? clips.map((c) => c.voiceover) : [voiceover])];
+  const voiceTracks: (AudioTrack | null)[] =
+    voiceMode === 'per-clip' ? clips.map((c) => c.voiceover) : voiceMode === 'ranges' ? ranges.map((r) => r.track) : [voiceover];
+  const activeTracks = [music, ...voiceTracks];
   const audioPending = activeTracks.some((t) => t && t.status !== 'ready');
   const overlays = clips.flatMap((c) => c.images);
   const hasError =
@@ -374,11 +447,26 @@ export default function App() {
   const plan = planTimeline(ready.map((c) => c.info.duration), ready.map((c) => c.transition), fps, logoSeconds, transitionSeconds);
   const totalSeconds = ready.length ? plan.totalFrames / fps : 0;
   const voiceOverflow =
-    !perClip && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (totalSeconds - logoSeconds) : 0;
-  const hasAnyVoice = perClip ? clips.some((c) => c.voiceover?.status === 'ready') : voiceover?.status === 'ready';
+    voiceMode === 'whole' && voiceover?.status === 'ready' && ready.length ? voiceover.buffer.duration - (totalSeconds - logoSeconds) : 0;
+  const hasAnyVoice =
+    voiceMode === 'per-clip'
+      ? clips.some((c) => c.voiceover?.status === 'ready')
+      : voiceMode === 'ranges'
+        ? ranges.some((r) => r.track.status === 'ready')
+        : voiceover?.status === 'ready';
   const sizeFor = (first: ClipInfo) => (preset === CUSTOM_PRESET ? customSize(custom.width, custom.height) : SIZE_PRESETS[preset](first));
   const outputSize = ready[0] ? sizeFor(ready[0].info) : null;
   const aspect = outputSize ? outputSize.width / outputSize.height : 16 / 9;
+
+  // File-size cap: compute the video bitrate it allows for this video, so we can show an honest estimate.
+  const maxBytes = targetBytes(sizeTarget, customMB);
+  const estVideoBps =
+    maxBytes && totalSeconds > 0 ? Math.floor((maxBytes * 8 * 0.94) / totalSeconds - AUDIO_BITRATE) : null;
+  const comfortableBps =
+    outputSize && fps ? (outputSize.width * outputSize.height) / (1280 * 720) * (fps / 30) * 1_300_000 : 0;
+  const capTooLow = estVideoBps !== null && estVideoBps < 120_000;
+  const capTight = estVideoBps !== null && !capTooLow && comfortableBps > 0 && estVideoBps < comfortableBps * 0.6;
+
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion'>(key: K) =>
     clips.length && clips.some((c) => c[key] !== clips[0][key]) ? 'mixed' : (clips[0]?.[key] ?? defaults[key]);
@@ -410,23 +498,28 @@ export default function App() {
     const added: Clip[] = media.map((file) => ({
       id: crypto.randomUUID(),
       file,
+      preview: null,
       status: 'probing',
       voiceover: null,
       images: [],
-      pill: { enabled: false, text: '', position: 'bottom-center', ...pillDefaults },
+      pill: { enabled: false, text: '', position: CENTER_BOTTOM, ...pillDefaults },
       ...defaults,
     }));
     setClips((prev) => [...prev, ...added]);
     setJob({ state: 'idle' });
 
-    const { probeClip, probeImage } = await loadEngine();
+    const { probeClip, probeImage, makeThumbnail } = await loadEngine();
     for (const clip of added) {
       const photo = isPhoto(clip.file);
       const probe = photo
         ? probeImage(clip.file).then(({ width, height }) => ({ width, height, duration: PHOTO_SECONDS.default, fps: NaN }))
         : probeClip(clip.file);
       probe.then(
-        (info) => update(clip.id, { status: 'ready', info, photo }),
+        (info) => {
+          update(clip.id, { status: 'ready', info, photo });
+          // A thumbnail is nice-to-have: if it fails, the clip still works.
+          makeThumbnail(clip.file, photo).then((preview) => update(clip.id, { preview }), () => {});
+        },
         (e: Error) => update(clip.id, { status: 'error', error: e.message }),
       );
     }
@@ -436,8 +529,11 @@ export default function App() {
   const setPhotoSeconds = (clip: Clip & { status: 'ready' }, seconds: number) =>
     update(clip.id, { info: { ...clip.info, duration: Math.min(PHOTO_SECONDS.max, Math.max(PHOTO_SECONDS.min, seconds || PHOTO_SECONDS.min)) } });
 
-  /** Releases the preview URLs a clip holds. */
-  const freeClip = (clip: Clip) => clip.images.forEach(freeOverlay);
+  /** Releases the preview URLs a clip holds (its thumbnail and every overlay). */
+  const freeClip = (clip: Clip) => {
+    if (clip.preview) URL.revokeObjectURL(clip.preview);
+    clip.images.forEach(freeOverlay);
+  };
 
   const update = (id: string, patch: Partial<Clip>) =>
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
@@ -515,6 +611,19 @@ export default function App() {
     }
   };
 
+  /** Adds a voiceover that spans a run of clips, starting across the whole timeline. */
+  const addRangeVoice = (file: File) => {
+    setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
+    const id = crypto.randomUUID();
+    setRanges((prev) => [...prev, { id, track: { file, status: 'loading' }, start: 0, end: Math.max(0, clips.length - 1) }]);
+    void decodeAudio(file, (track) =>
+      setRanges((prev) => prev.map((r) => (r.id === id && r.track.file === file ? { ...r, track } : r))),
+    );
+  };
+  const updateRange = (id: string, patch: Partial<Pick<VoiceRange, 'start' | 'end'>>) =>
+    setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const removeRange = (id: string) => setRanges((prev) => prev.filter((r) => r.id !== id));
+
   const addMusic = (file: File) => {
     setMusic({ file, status: 'loading' });
     void decodeAudio(file, (track) => setMusic((current) => (current?.file === file ? track : current)));
@@ -540,6 +649,7 @@ export default function App() {
     const startedAt = performance.now();
     setJob({ state: 'rendering', progress: 0, stage: 'Preparing', startedAt, updatedAt: startedAt });
     const wakeLock: { current?: WakeLockSentinel } = {};
+    const lastClip = ready.length - 1;
 
     try {
       const { renderVideo } = await loadEngine();
@@ -574,10 +684,22 @@ export default function App() {
         logoSeconds,
         transitionSeconds,
         quality,
+        maxBytes,
+        border,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
-        voiceover: perClip ? undefined : readyBuffer(voiceover),
+        voiceover: voiceMode === 'whole' ? readyBuffer(voiceover) : undefined,
+        voiceRanges:
+          voiceMode === 'ranges'
+            ? ranges.flatMap((r) => {
+                const buffer = readyBuffer(r.track);
+                if (!buffer) return [];
+                const start = Math.max(0, Math.min(lastClip, r.start));
+                const end = Math.max(start, Math.min(lastClip, r.end));
+                return [{ buffer, start, end }];
+              })
+            : undefined,
         music: readyBuffer(music),
         signal: controller.signal,
         onProgress: (progress, stage) => {
@@ -606,6 +728,7 @@ export default function App() {
     clips.forEach(freeClip);
     setClips([]);
     setVoiceover(null);
+    setRanges([]);
     setMusic(null);
     setJob({ state: 'idle' });
   };
@@ -663,7 +786,7 @@ export default function App() {
 
           <div className="mode" role="radiogroup" aria-label="Voiceover">
             <span className="muted">Voiceover</span>
-            {(['whole', 'per-clip'] as const).map((mode) => (
+            {(['whole', 'ranges', 'per-clip'] as const).map((mode) => (
               <button
                 key={mode}
                 role="radio"
@@ -672,7 +795,7 @@ export default function App() {
                 disabled={busy}
                 onClick={() => setVoiceMode(mode)}
               >
-                {mode === 'whole' ? 'One file for the whole video' : 'Separate file for each clip'}
+                {mode === 'whole' ? 'One file for the whole video' : mode === 'ranges' ? 'One file for a range of clips' : 'Separate file for each clip'}
               </button>
             ))}
           </div>
@@ -692,9 +815,16 @@ export default function App() {
                 <li key={clip.id} className={`clip ${clip.status}`}>
                   <div className="clip-row">
                     <span className="index">{i + 1}</span>
-                    <span className="name" title={clip.file.name}>
-                      {clip.file.name}
-                      {clip.status === 'error' && <small>{clip.error}</small>}
+                    <span className="name">
+                      {clip.preview ? (
+                        <img className="thumb" src={clip.preview} alt="" />
+                      ) : (
+                        <span className="thumb placeholder" aria-hidden="true" />
+                      )}
+                      <span className="label" title={clip.file.name}>
+                        {clip.file.name}
+                        {clip.status === 'error' && <small>{clip.error}</small>}
+                      </span>
                     </span>
                     <span className="meta">
                       {clip.status === 'probing' && 'Reading…'}
@@ -827,6 +957,7 @@ export default function App() {
                         {clip.images.map((overlay, n) => (
                           <div key={overlay.id} className="image-item">
                             <div className={`slot-file${overlay.status === 'error' ? ' error' : ''}`}>
+                              <img className="thumb" src={overlay.url} alt="" />
                               <span className="name" title={overlay.file.name}>
                                 {n + 1}. {overlay.file.name}
                                 {overlay.status === 'error' && <small>{overlay.error}</small>}
@@ -892,23 +1023,93 @@ export default function App() {
             <div className="slot">
               <div className="slot-head">
                 <strong>Voiceover</strong>
-                <span className="muted">{perClip ? 'Add a file to each clip above' : 'Starts with the first clip'}</span>
+                <span className="muted">
+                  {perClip ? 'Add a file to each clip above' : voiceMode === 'ranges' ? 'Add files that each cover a run of clips' : 'Starts with the first clip'}
+                </span>
               </div>
-              {!perClip && (
-                <AudioPicker
-                  label="Voiceover"
-                  track={voiceover}
-                  disabled={busy}
-                  onFile={(file) => addVoiceover(file)}
-                  onRemove={() => setVoiceover(null)}
-                />
+
+              {voiceMode === 'whole' && (
+                <>
+                  <AudioPicker
+                    label="Voiceover"
+                    track={voiceover}
+                    disabled={busy}
+                    onFile={(file) => addVoiceover(file)}
+                    onRemove={() => setVoiceover(null)}
+                  />
+                  {voiceOverflow > 0.5 && (
+                    <p className="hint warn">
+                      The voiceover is {formatTime(voiceOverflow)} longer than the video and will be cut at the end.
+                    </p>
+                  )}
+                </>
               )}
+
+              {voiceMode === 'ranges' && (
+                <div className="ranges">
+                  {ranges.map((r) => {
+                    const buffer = readyBuffer(r.track);
+                    const start = Math.max(0, Math.min(clips.length - 1, r.start));
+                    const end = Math.max(start, Math.min(clips.length - 1, r.end));
+                    const spanSeconds =
+                      ready.length && plan.clips[start] && plan.clips[end]
+                        ? (plan.clips[end].start + plan.clips[end].frames - plan.clips[start].start) / fps
+                        : 0;
+                    const overflow = buffer ? buffer.duration - spanSeconds : 0;
+                    return (
+                      <div key={r.id} className="range-item">
+                        <div className={`slot-file${r.track.status === 'error' ? ' error' : ''}`}>
+                          <span className="name" title={r.track.file.name}>
+                            {r.track.file.name}
+                            {r.track.status === 'error' && <small>{r.track.error}</small>}
+                          </span>
+                          <span className="meta">
+                            {r.track.status === 'loading' && 'Reading…'}
+                            {r.track.status === 'ready' && formatTime(r.track.buffer.duration)}
+                          </span>
+                          <span className="actions">
+                            <button onClick={() => removeRange(r.id)} disabled={busy} aria-label="Remove voiceover">✕</button>
+                          </span>
+                        </div>
+                        <div className="range-span">
+                          <span>Plays over</span>
+                          <select value={start} disabled={busy} onChange={(e) => updateRange(r.id, { start: Number(e.target.value), end: Math.max(Number(e.target.value), end) })}>
+                            {clips.map((_, idx) => (
+                              <option key={idx} value={idx}>Clip {idx + 1}</option>
+                            ))}
+                          </select>
+                          <span>to</span>
+                          <select value={end} disabled={busy} onChange={(e) => updateRange(r.id, { end: Math.max(start, Number(e.target.value)) })}>
+                            {clips.map((_, idx) => (idx >= start ? <option key={idx} value={idx}>Clip {idx + 1}</option> : null))}
+                          </select>
+                        </div>
+                        {overflow > 0.5 && (
+                          <p className="hint warn">
+                            This voiceover is {formatTime(overflow)} longer than clips {start + 1}–{end + 1} and will be cut at the end.
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                  <label className={`slot-pick${busy ? ' disabled' : ''}`}>
+                    + Add voiceover for a range of clips
+                    <input
+                      type="file"
+                      accept="audio/*,.mp3,.wav,.m4a,.aac"
+                      hidden
+                      disabled={busy}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) addRangeVoice(file);
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                  {clips.length < 2 && <p className="hint muted">Add at least two clips to span a voiceover across a range.</p>}
+                </div>
+              )}
+
               {hasAnyVoice && <VolumeSlider value={voiceVolume} onChange={setVoiceVolume} disabled={busy} />}
-              {voiceOverflow > 0.5 && (
-                <p className="hint warn">
-                  The voiceover is {formatTime(voiceOverflow)} longer than the video and will be cut at the end.
-                </p>
-              )}
             </div>
 
             <div className="slot">
@@ -1003,11 +1204,12 @@ export default function App() {
             </label>
             <label>
               Quality
-              <select value={quality} onChange={(e) => setQuality(e.target.value as Quality)} disabled={busy}>
+              <select value={quality} disabled={busy || sizeTarget !== 'none'} onChange={(e) => setQuality(e.target.value as Quality)}>
                 {(Object.keys(QUALITY_LABELS) as Quality[]).map((q) => (
                   <option key={q} value={q}>{QUALITY_LABELS[q]}</option>
                 ))}
               </select>
+              {sizeTarget !== 'none' && <span className="meta">Set by the file-size limit below</span>}
             </label>
             <label>
               Frame rate
@@ -1016,6 +1218,72 @@ export default function App() {
                 <option value="smooth">Match clips, up to 60 fps (smoother)</option>
               </select>
             </label>
+            <label>
+              Maximum file size
+              <select value={sizeTarget} onChange={(e) => setSizeTarget(e.target.value as SizeTarget)} disabled={busy}>
+                {(Object.keys(SIZE_TARGET_LABELS) as SizeTarget[]).map((t) => (
+                  <option key={t} value={t}>{SIZE_TARGET_LABELS[t]}</option>
+                ))}
+              </select>
+              {sizeTarget === 'custom' && (
+                <span className="custom-size">
+                  <input
+                    className="text"
+                    type="number"
+                    inputMode="decimal"
+                    aria-label="Maximum size in MB"
+                    min={0.2}
+                    step={0.5}
+                    value={customMB}
+                    disabled={busy}
+                    onChange={(e) => setCustomMB(Math.max(0.2, Number(e.target.value) || 0.2))}
+                  />
+                  <span>MB</span>
+                </span>
+              )}
+            </label>
+          </div>
+
+          {maxBytes && estVideoBps !== null && (
+            <p className={`hint ${capTooLow ? 'error' : capTight ? 'warn' : 'muted'}`}>
+              {capTooLow
+                ? `A ${formatCap(maxBytes)} limit is very tight for a ${formatTime(totalSeconds)} video — the file may go slightly over, and quality will drop. Shorten the video or raise the limit.`
+                : capTight
+                  ? `Fitting under ${formatCap(maxBytes)} needs about ${Math.round(estVideoBps / 1000)} kbps of video, so some quality is traded for the smaller file. Shorten the video or raise the limit for full quality.`
+                  : `Targets about ${Math.round(estVideoBps / 1000)} kbps to stay under ${formatCap(maxBytes)}${!IS_SAFARI ? ', using HEVC where your Mac supports it' : ''} — no visible quality loss expected at this length. Resolution is unchanged.`}
+            </p>
+          )}
+
+          <div className="border-controls">
+            <div className="settings">
+              <label>
+                Border thickness
+                <span className="color-row">
+                  <input
+                    type="range"
+                    min={0}
+                    max={BORDER_MAX_PCT}
+                    step={1}
+                    value={Math.round(border.fraction * 100)}
+                    disabled={busy}
+                    onChange={(e) => setBorder((b) => ({ ...b, fraction: Number(e.target.value) / 100 }))}
+                  />
+                  <span className="meta">
+                    {Math.round(border.fraction * 100)}%
+                    {outputSize && border.fraction > 0 && ` · ≈${Math.round(border.fraction * Math.min(outputSize.width, outputSize.height))}px`}
+                  </span>
+                </span>
+              </label>
+              <label>
+                Border colour
+                <span className="color-row">
+                  <input type="color" value={border.color} disabled={busy || border.fraction === 0} onChange={(e) => setBorder((b) => ({ ...b, color: e.target.value }))} />
+                  <span className="meta">{border.fraction === 0 ? 'No border' : border.color.toUpperCase()}</span>
+                </span>
+              </label>
+            </div>
+            <BorderPreview aspect={aspect} border={border} />
+            <span className="muted">Your clips, logo and images are fitted inside the border, so nothing is covered by it.</span>
           </div>
 
           {job.state === 'rendering' ? (

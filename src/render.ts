@@ -19,6 +19,7 @@ import {
   Output,
   StreamTarget,
   type StreamTargetChunk,
+  type VideoCodec,
   type WrappedAudioBuffer,
 } from 'mediabunny';
 
@@ -48,6 +49,18 @@ const CLIP_VOICE_FADE_OUT = 0.3;
 const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
+/**
+ * Audio bitrate when a file-size cap is set: 128 kbps AAC stereo is transparent for voice + music,
+ * and a fixed value makes the size-budget maths exact. Without a cap, the best-quality setting is used.
+ */
+const CAP_AUDIO_BITRATE = 128_000;
+/** Never drop below this video bitrate: beyond it the picture falls apart and the cap stops being worth it. */
+const MIN_VIDEO_BITRATE = 120_000;
+/** Leave this share of the cap for container overhead so the real file stays under the limit. */
+const SIZE_CAP_HEADROOM = 0.94;
+
+const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
 /** A caption shown in a rounded box over one clip. */
 export type TextPill = {
@@ -74,6 +87,12 @@ export type RenderClip = {
   images: { file: File; cells: number[] }[];
 };
 
+/** A frame drawn around the whole video; content is fitted inside it so nothing touches the edge. */
+export type Border = { fraction: number; color: string };
+
+/** One voiceover that spans a run of clips, by their position in `clips` (inclusive). */
+export type VoiceRange = { buffer: AudioBuffer; start: number; end: number };
+
 export type RenderOptions = {
   clips: RenderClip[];
   logo: ImageBitmap;
@@ -82,12 +101,18 @@ export type RenderOptions = {
   logoSeconds: number;
   transitionSeconds: number;
   quality: Quality;
+  /** When set, the output is encoded to stay under this many bytes (resolution unchanged). */
+  maxBytes?: number;
+  /** A coloured frame around the video; `fraction` 0 = none. */
+  border: Border;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
   musicVolume: number;
   /** One voiceover for the whole video: starts with the first clip and plays once. */
   voiceover?: AudioBuffer;
+  /** Voiceovers that each cover a run of clips. */
+  voiceRanges?: VoiceRange[];
   /** Plays under the whole video, looping if shorter, with fades at both ends. */
   music?: AudioBuffer;
   signal: AbortSignal;
@@ -155,6 +180,47 @@ export async function probeImage(file: File): Promise<Size> {
   }
 }
 
+/** Longest edge of a clip/image thumbnail, in pixels. Small, so many clips stay light. */
+const THUMBNAIL_MAX_EDGE = 240;
+
+/**
+ * Builds a small still preview for a clip and returns an object URL (JPEG, so it shows in every browser).
+ * Callers own the URL and must revokeObjectURL it. A photo uses its own pixels; a video uses its first frame.
+ */
+export async function makeThumbnail(file: File, photo: boolean): Promise<string> {
+  if (photo) {
+    const bitmap = await decodeImage(file, THUMBNAIL_MAX_EDGE);
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    canvas.getContext('2d', { alpha: false })!.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 }));
+  }
+  const input = openInput(file);
+  try {
+    const track = await input.getPrimaryVideoTrack();
+    if (!track || !(await track.canDecode())) throw new Error('No preview available.');
+    const [w, h, origin] = await Promise.all([track.getDisplayWidth(), track.getDisplayHeight(), input.getFirstTimestamp()]);
+    const scale = Math.min(1, THUMBNAIL_MAX_EDGE / Math.max(w, h));
+    const tw = toEven(w * scale);
+    const th = toEven(h * scale);
+    const sink = new CanvasSink(track, { width: tw, height: th, fit: 'contain', poolSize: 1 });
+    // Take the first actually-decoded frame, not the frame at the exact first timestamp:
+    // some formats report a start just before their first key frame, where getCanvas returns null.
+    const frames = sink.canvases(origin);
+    const first = await frames.next();
+    void frames.return();
+    if (first.done || !first.value) throw new Error('No preview available.');
+    const canvas = new OffscreenCanvas(tw, th);
+    const ctx = canvas.getContext('2d', { alpha: false })!;
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, tw, th);
+    ctx.drawImage(first.value.canvas, 0, 0);
+    return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 }));
+  } finally {
+    input.dispose();
+  }
+}
+
 /**
  * Finished exports are streamed into the browser's private on-disk storage (Origin Private File System)
  * instead of being held in memory, so the output can be many gigabytes. One export is kept at a time.
@@ -175,7 +241,7 @@ export async function clearExports() {
 const STALL_MS = 20_000;
 
 /** Thrown when an encoder or the output file stops responding. */
-class StallError extends Error {}
+export class StallError extends Error {}
 
 /**
  * Rejects with a StallError if `promise` has not settled within `ms`, or with the abort reason as soon as
@@ -200,7 +266,7 @@ function withTimeout<T>(promise: Promise<T>, what: string, ms = STALL_MS, signal
  * pipeline waits for them to be released, and their on-disk storage writer is new, so they use the
  * compatible profile from the start.
  */
-const IS_WEBKIT = typeof navigator !== 'undefined' && navigator.vendor === 'Apple Computer, Inc.';
+export const IS_WEBKIT = typeof navigator !== 'undefined' && navigator.vendor === 'Apple Computer, Inc.';
 
 /** Where the MP4 is written: on disk when allowed (`useDisk`) and supported, otherwise in memory. */
 async function createTarget(useDisk: boolean) {
@@ -352,11 +418,12 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, widt
   const boxH = lines.length * lineHeight + padY * 2;
   const radius = Math.min(boxH / 2, fontSize * 1.1);
 
-  const [vertical, horizontal] = position.split('-');
-  const x = horizontal === 'left' ? margin : horizontal === 'right' ? width - margin - boxW : (width - boxW) / 2;
-  const y = vertical === 'top' ? margin : vertical === 'bottom' ? height - margin - boxH : (height - boxH) / 2;
-  const align: CanvasTextAlign = horizontal === 'left' ? 'left' : horizontal === 'right' ? 'right' : 'center';
-  const textX = align === 'left' ? x + padX : align === 'right' ? x + boxW - padX : x + boxW / 2;
+  // Position the box anywhere in the safe area: (0,0) hugs the top-left margin, (1,1) the bottom-right.
+  const availW = Math.max(0, width - margin * 2 - boxW);
+  const availH = Math.max(0, height - margin * 2 - boxH);
+  const x = margin + clamp01(position.x) * availW;
+  const y = margin + clamp01(position.y) * availH;
+  const textX = x + boxW / 2;
 
   return (alpha: number) => {
     if (alpha <= 0) return;
@@ -368,7 +435,7 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, widt
     ctx.fill();
     ctx.font = font;
     ctx.fillStyle = color;
-    ctx.textAlign = align;
+    ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     lines.forEach((line, i) => ctx.fillText(line, textX, y + padY + lineHeight * (i + 0.5)));
     ctx.restore();
@@ -488,25 +555,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   };
   setStage('Checking encoders');
 
-  const videoBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
-  const software = { hardwareAcceleration: 'prefer-software' as const, latencyMode: 'realtime' as const };
-  const videoCodecOptions = { width, height, bitrate: videoBitrate };
-  const softwareVideo = compatible && (await getFirstEncodableVideoCodec(['avc'], { ...videoCodecOptions, ...software })) === 'avc';
-  const videoCodec = softwareVideo ? 'avc' : await getFirstEncodableVideoCodec(['avc', 'hevc'], videoCodecOptions);
-  if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
-  // AAC plays everywhere, so it comes first, except on the Chrome retry, where the AAC encoder may be the stuck part.
-  const audioCodec = await getFirstEncodableAudioCodec(compatible && !IS_WEBKIT ? ['opus', 'aac'] : ['aac', 'opus'], {
-    numberOfChannels: CHANNELS,
-    sampleRate: SAMPLE_RATE,
-    bitrate: QUALITY_VERY_HIGH,
-  });
-  if (!audioCodec) throw new Error('This browser cannot encode audio for MP4.');
-
-  const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext('2d', { alpha: false })!;
-  ctx.imageSmoothingQuality = 'high';
-
-  // Plan every frame up front so progress is exact and transitions and fades land precisely.
+  // Plan every frame up front so progress is exact, transitions land precisely, and the size budget is known.
   const plan = planTimeline(
     clips.map((c) => c.info.duration),
     clips.map((c) => c.transition),
@@ -515,6 +564,52 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     transitionSeconds,
   );
   const { logoFrames, totalFrames } = plan;
+  const totalSeconds = totalFrames / fps;
+
+  // Pick the video bitrate: either a quality preset, or the exact rate that fits the chosen file-size cap.
+  const qualityBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
+  const capped = typeof options.maxBytes === 'number' && options.maxBytes > 0;
+  const audioBitrate = capped ? CAP_AUDIO_BITRATE : QUALITY_VERY_HIGH;
+  const videoBitrate: number | typeof QUALITY_VERY_HIGH = capped
+    ? Math.max(
+        MIN_VIDEO_BITRATE,
+        Math.floor((options.maxBytes! * 8 * SIZE_CAP_HEADROOM - CAP_AUDIO_BITRATE * totalSeconds) / Math.max(0.1, totalSeconds)),
+      )
+    : qualityBitrate;
+
+  const software = { hardwareAcceleration: 'prefer-software' as const, latencyMode: 'realtime' as const };
+  const videoCodecOptions = { width, height, bitrate: videoBitrate };
+  const softwareVideo = compatible && (await getFirstEncodableVideoCodec(['avc'], { ...videoCodecOptions, ...software })) === 'avc';
+  // With a size cap, HEVC fits more picture into the same bytes — so prefer it (except on the Safari/software paths,
+  // which stay on AVC for reliability). Otherwise AVC first, for the widest playback.
+  const preferHevc = capped && !compatible && !IS_WEBKIT;
+  const codecOrder: VideoCodec[] = softwareVideo ? ['avc'] : preferHevc ? ['hevc', 'avc'] : ['avc', 'hevc'];
+  const videoCodec = softwareVideo ? 'avc' : await getFirstEncodableVideoCodec(codecOrder, videoCodecOptions);
+  if (!videoCodec) throw new Error(`This browser cannot encode ${width}×${height} video. Try a smaller output size.`);
+  // AAC plays everywhere, so it comes first, except on the Chrome retry, where the AAC encoder may be the stuck part.
+  const audioCodec = await getFirstEncodableAudioCodec(compatible && !IS_WEBKIT ? ['opus', 'aac'] : ['aac', 'opus'], {
+    numberOfChannels: CHANNELS,
+    sampleRate: SAMPLE_RATE,
+    bitrate: audioBitrate,
+  });
+  if (!audioCodec) throw new Error('This browser cannot encode audio for MP4.');
+
+  // The MP4 is always the full output size. A border, if any, frames a slightly smaller content area
+  // that everything (video, photos, logo, pills, images) is drawn into — so nothing touches the edge.
+  const borderPx = options.border.fraction > 0 ? Math.round(options.border.fraction * Math.min(width, height)) : 0;
+  const cw = borderPx > 0 ? toEven(width - 2 * borderPx) : width;
+  const ch = borderPx > 0 ? toEven(height - 2 * borderPx) : height;
+  const hasBorder = cw < width || ch < height;
+  const offX = Math.round((width - cw) / 2);
+  const offY = Math.round((height - ch) / 2);
+
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d', { alpha: false })!;
+  ctx.imageSmoothingQuality = 'high';
+  // Content is drawn here (its own canvas when there's a border, otherwise straight onto the output canvas).
+  const frameCanvas = hasBorder ? new OffscreenCanvas(cw, ch) : canvas;
+  const cctx = hasBorder ? frameCanvas.getContext('2d', { alpha: false })! : ctx;
+  cctx.imageSmoothingQuality = 'high';
 
   // Exact packet counts let the muxer reserve the index up front (fast start without buffering in memory).
   // Audio packets are 960 (Opus) or 1024 (AAC) samples; the smaller size gives the safe upper bound.
@@ -528,13 +623,12 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     keyFrameInterval: 2,
     ...(softwareVideo ? software : compatible ? { latencyMode: 'realtime' as const } : {}),
   });
-  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: QUALITY_VERY_HIGH });
+  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: audioBitrate });
   output.addVideoTrack(videoSource, { frameRate: fps, maximumPacketCount: totalFrames + 16 });
   output.addAudioTrack(audioSource, { maximumPacketCount: Math.ceil(audioPackets * 1.1) + 16 });
   const clipsEnd = totalFrames - logoFrames;
   const audioChunkFrames = Math.max(1, Math.round(AUDIO_CHUNK_SECONDS * fps));
 
-  const totalSeconds = totalFrames / fps;
   const voiceStart = logoFrames / fps;
   const musicFadeOutStart = Math.max(MUSIC_FADE_IN, totalSeconds - MUSIC_FADE_OUT);
   const musicEnvelope: Envelope = [
@@ -543,7 +637,20 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     [musicFadeOutStart, 1],
     [Math.max(musicFadeOutStart, totalSeconds), 0],
   ];
-  const useLimiter = Boolean(voiceover || music || clips.some((c) => c.voiceover));
+
+  // Voiceovers that span a run of clips, converted from clip positions to exact seconds on the timeline.
+  const rangeVoices = (options.voiceRanges ?? [])
+    .map((range) => {
+      const s = Math.max(0, Math.min(clips.length - 1, range.start));
+      const e = Math.max(s, Math.min(clips.length - 1, range.end));
+      const startClip = plan.clips[s];
+      const endClip = plan.clips[e];
+      if (!startClip || !endClip) return null;
+      return { buffer: range.buffer, start: startClip.start / fps, end: (endClip.start + endClip.frames) / fps };
+    })
+    .filter((v): v is { buffer: AudioBuffer; start: number; end: number } => v !== null);
+
+  const useLimiter = Boolean(voiceover || music || rangeVoices.length || clips.some((c) => c.voiceover));
 
   let frameIndex = 0;
   let audioWritten = 0;
@@ -551,6 +658,12 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   // Timestamps derive from the global frame index, so video and audio can never drift apart.
   const addVideoFrame = async () => {
     signal.throwIfAborted();
+    if (hasBorder) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = options.border.color;
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(frameCanvas, offX, offY);
+    }
     await withTimeout(videoSource.add(frameIndex / fps, 1 / fps), 'The video encoder', STALL_MS, signal);
     frameIndex++;
     progress = frameIndex / totalFrames;
@@ -616,6 +729,9 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     if (voiceover) {
       scheduleVoice(context, bus, voiceover, voiceStart, totalSeconds, VOICE_FADE_OUT, from, to);
     }
+    for (const range of rangeVoices) {
+      scheduleVoice(context, bus, range.buffer, range.start, range.end, VOICE_FADE_OUT, from, to);
+    }
     if (music && musicVolume > 0) {
       const source = new AudioBufferSourceNode(context, { buffer: music, loop: true });
       const gain = new GainNode(context);
@@ -638,33 +754,33 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 
   const renderLogo = async () => {
     const fadeFrames = Math.max(1, Math.min(Math.round(0.6 * fps), Math.floor(logoFrames / 3)));
-    const scale = Math.min((width * 0.5) / logo.width, (height * 0.45) / logo.height);
+    const scale = Math.min((cw * 0.5) / logo.width, (ch * 0.45) / logo.height);
     const w = logo.width * scale;
     const h = logo.height * scale;
 
     for (let i = 0; i < logoFrames; i++) {
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, width, height);
-      ctx.globalAlpha = Math.min(1, i / fadeFrames, (logoFrames - 1 - i) / fadeFrames);
-      ctx.drawImage(logo, (width - w) / 2, (height - h) / 2, w, h);
+      cctx.globalAlpha = 1;
+      cctx.fillStyle = '#ffffff';
+      cctx.fillRect(0, 0, cw, ch);
+      cctx.globalAlpha = Math.min(1, i / fadeFrames, (logoFrames - 1 - i) / fadeFrames);
+      cctx.drawImage(logo, (cw - w) / 2, (ch - h) / 2, w, h);
       await addVideoFrame();
       if ((i + 1) % audioChunkFrames === 0) await syncAudio();
     }
-    ctx.globalAlpha = 1;
+    cctx.globalAlpha = 1;
     await syncAudio();
   };
 
-  /** A photo, decoded at output size, letterboxed onto a canvas once and reused for every frame. */
+  /** A photo, decoded at content size, letterboxed onto a canvas once and reused for every frame. */
   const stillSource = async (file: File) => {
-    const bitmap = await decodeImage(file, Math.max(width, height));
-    const still = new OffscreenCanvas(width, height);
+    const bitmap = await decodeImage(file, Math.max(cw, ch));
+    const still = new OffscreenCanvas(cw, ch);
     const g = still.getContext('2d', { alpha: false })!;
     g.imageSmoothingQuality = 'high';
     g.fillStyle = '#000000';
-    g.fillRect(0, 0, width, height);
-    const s = Math.min(width / bitmap.width, height / bitmap.height);
-    g.drawImage(bitmap, (width - bitmap.width * s) / 2, (height - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
+    g.fillRect(0, 0, cw, ch);
+    const s = Math.min(cw / bitmap.width, ch / bitmap.height);
+    g.drawImage(bitmap, (cw - bitmap.width * s) / 2, (ch - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
     bitmap.close();
     return { next: async () => still, close: () => {} };
   };
@@ -678,7 +794,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
       segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
     }
-    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
+    const sink = new CanvasSink(videoTrack, { width: cw, height: ch, fit: 'contain', poolSize: 2 });
     const canvases = sink.canvasesAtTimestamps(
       (function* () {
         for (let i = 0; i < frames; i++) yield origin + i / fps;
@@ -712,38 +828,38 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment);
     activeSegments.add(segment);
 
-    const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
+    const drawPill = clip.pill?.text.trim() ? createPill(cctx, clip.pill, cw, ch) : null;
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
       clip.images.map(async ({ file, cells }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), cells })),
     );
-    const drawImages = overlays.map(({ bitmap, cells }) => createImageOverlay(ctx, bitmap, cells, width, height));
+    const drawImages = overlays.map(({ bitmap, cells }) => createImageOverlay(cctx, bitmap, cells, cw, ch));
     const overlayFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor(planned.frames / 3)));
     let k = 0;
 
     return {
-      /** Draws this clip's next frame onto the output canvas, applying transition and zoom. */
+      /** Draws this clip's next frame onto the content canvas, applying transition and zoom. */
       async draw() {
         const frame = await source.next();
         const { alpha, offsetX, reveal, scale } = layerAt(planned, clip.motion, k);
 
-        ctx.save();
-        ctx.globalAlpha = alpha;
-        ctx.translate(offsetX * width, 0);
+        cctx.save();
+        cctx.globalAlpha = alpha;
+        cctx.translate(offsetX * cw, 0);
         if (reveal < 1) {
-          ctx.beginPath();
-          ctx.rect(0, 0, reveal * width, height);
-          ctx.clip();
+          cctx.beginPath();
+          cctx.rect(0, 0, reveal * cw, ch);
+          cctx.clip();
         }
         if (frame) {
-          const w = width * scale;
-          const h = height * scale;
-          ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
+          const w = cw * scale;
+          const h = ch * scale;
+          cctx.drawImage(frame, (cw - w) / 2, (ch - h) / 2, w, h);
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
         drawImages.forEach((draw) => draw(overlayAlpha));
         drawPill?.(overlayAlpha);
-        ctx.restore();
+        cctx.restore();
         k++;
       },
       /** True once every frame of this clip has been drawn. */
@@ -771,8 +887,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
           open.push(await openClip(clips[nextClip], plan.clips[nextClip]));
           nextClip++;
         }
-        ctx.fillStyle = '#000000';
-        ctx.fillRect(0, 0, width, height);
+        cctx.fillStyle = '#000000';
+        cctx.fillRect(0, 0, cw, ch);
         for (const clip of open) await clip.draw(); // older clip first, the incoming one on top
         await addVideoFrame();
 

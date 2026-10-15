@@ -1,6 +1,6 @@
 # Roothoot Video Editor
 
-Upload any number of video clips and photos (each photo shown for a chosen number of seconds), put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion and a text pill (caption) to any clip, a voiceover (one for the whole video or one per clip) and background music, and export one MP4 with the Roothoot logo as an animated intro and outro.
+Upload any number of video clips and photos (each photo shown for a chosen number of seconds), put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion, a text pill (caption) placed on a 5×5 grid, and overlay images to any clip, a voiceover (one for the whole video, one per clip, or one covering a chosen run of clips) and background music, choose the output size (including Instagram and square ad formats) and an optional coloured border, cap the file size to a target (e.g. 2 MB mobile / 5 MB desktop) with no change to the resolution, and export one MP4 with the Roothoot logo as an animated intro and outro.
 
 **Live:** deployed on Vercel (free tier) — static site, no backend.
 
@@ -12,7 +12,7 @@ Browser (Chrome / Edge / Safari)
  ├─ WebCodecs decodes frames on the GPU media engine
  ├─ Each frame is letterboxed onto one canvas at the output size and frame rate, with zoom, transitions and text pills composited on top
  ├─ Clip sound, voiceover and music are mixed (Web Audio) at 48 kHz stereo, in sync with the video
- └─ WebCodecs encodes H.264 + AAC → MP4 streamed to on-disk browser storage (OPFS) → preview / download
+ └─ WebCodecs encodes H.264 (or HEVC when a size cap is set) + AAC → MP4 streamed to on-disk browser storage (OPFS) → preview / download
 ```
 
 | Decision | Why |
@@ -33,6 +33,12 @@ Browser (Chrome / Edge / Safari)
 | Input videos read lazily from disk (`BlobSource`); photos and overlay images decoded only while their clip is on screen | Memory stays flat no matter how large or how many the inputs are |
 | Encoder watchdog: a step that returns nothing for 20 s triggers one automatic retry with a compatible profile (realtime encoding, software video where offered, in-memory output) | Some devices' encoders hold frames back indefinitely; the export recovers instead of hanging |
 | Safari/iOS (WebKit) use the compatible profile from the start | WebKit's encoder can wait for more frames than the pipeline sends, and its on-disk writer is new; realtime mode returns every frame immediately |
+| Optional file-size cap sets the exact video bitrate for the whole video (`maxBytes`), preferring HEVC where supported; resolution never changes | Hits a hard size target (e.g. 2 MB / 5 MB ad limits) with the least possible quality loss. At a fixed resolution, size is governed by bitrate, so the UI shows the exact bitrate the cap allows and warns when a cap is too tight for the video's length rather than degrading silently |
+| HEVC preferred only when a cap is set and not on WebKit/software paths | HEVC fits ~40% more picture into the same bytes, so a given cap costs less quality; AVC stays the default elsewhere for the widest playback |
+| Optional border renders content into an inner canvas composited inside the frame | A coloured border can never cover the video, logo, pills or images — they are fitted inside it, not drawn over |
+| Text-pill position is a normalised x/y anchor, snapped to a 5×5 grid in the UI | More placement choices without changing the engine; the grid size is one UI constant |
+| A voiceover can span a chosen run of clips (`voiceRanges`, by clip index → exact seconds) | One narration file often covers two or three clips in sequence; it plays across the run and fades at the end |
+| First-frame thumbnail generated for every clip (first decoded frame for video, the image itself for photos) | Clips are identified at a glance; generated off the main path and falling back to a placeholder, so it never blocks or breaks an import |
 | Screen wake lock during export | Long exports don't stop because the computer went to sleep |
 | Media engine lazy-loaded | Page paints instantly; engine loads in the background |
 

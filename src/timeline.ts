@@ -7,7 +7,12 @@ export type ClipInfo = { width: number; height: number; duration: number; fps: n
 
 export type Size = { width: number; height: number };
 
-export type PillPosition = `${'top' | 'middle' | 'bottom'}-${'left' | 'center' | 'right'}`;
+/**
+ * Where a text pill sits, as a fraction of the safe area: x 0 = far left, 1 = far right;
+ * y 0 = top, 1 = bottom. The UI snaps these to a grid, so the grid can be any size without
+ * changing the engine.
+ */
+export type PillPosition = { x: number; y: number };
 
 /** How a clip hands over to the next one. */
 export type Transition = 'cut' | 'dissolve' | 'fade' | 'slide' | 'wipe';
