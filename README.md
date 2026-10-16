@@ -1,6 +1,6 @@
 # Roothoot Video Editor
 
-Upload any number of video clips and photos (each photo shown for a chosen number of seconds), put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion, a text pill (caption) placed on a 5×5 grid, and overlay images positioned by dragging them over the clip's first frame, a voiceover (one for the whole video, one per clip, or one covering a chosen run of clips) and background music, choose the output size (including Instagram and square ad formats), optionally cap the file size to a target (e.g. 2 MB mobile / 5 MB desktop) without changing the resolution, and export one H.264 MP4 with the Roothoot logo as an animated intro and outro.
+Upload any number of video clips and photos (each photo shown for a chosen number of seconds), put them in order, optionally add transitions (dissolve, fade, slide, wipe), zoom in/out motion, a text pill (caption) placed on a 5×5 grid, and overlay images positioned by dragging them over the clip's first frame, a voiceover (one for the whole video, one per clip, or one covering a chosen run of clips) and background music, choose the output size (including Instagram and square ad formats), and export one best-quality H.264 MP4 with the Roothoot logo as an animated intro and outro. The export runs at the clips' original resolution (up to 4K) and frame rate — nothing is compressed down or dropped. The finished video can be downloaded as-is, or repackaged as a standard H.264 MP4 at the same quality for the widest compatibility.
 
 **Live:** deployed on Vercel (free tier) — static site, no backend.
 
@@ -28,13 +28,14 @@ Browser (Chrome / Edge / Safari)
 | Stateless soft limiter on the mix | Loud layers can never clip, with no artefacts between chunks |
 | Timeline planned on an exact frame grid (`timeline.ts`) shared by UI and engine | Durations shown in the UI match the export; overlapping transitions shorten the video exactly as previewed |
 | Overlapping clips decoded side by side, audio crossfaded with the picture | Dissolve/slide/wipe look and sound seamless |
-| Default output 1080p at up to 30 fps | Phone footage is often 4K60 — 1080p30 is ~8× fewer pixels to encode, so exports are much faster |
+| Default output: original resolution (up to 4K) at the clips' own frame rate, very-high bitrate | Best quality — no downscaling and no frames skipped. Smaller/faster sizes (1080p, 720p) and a 30 fps cap are still selectable when the user wants them |
 | Export streamed to the Origin Private File System, with the MP4 index reserved up front (`fastStart: 'reserve'`) | Output size is limited by free disk space, not RAM; files stay fast-start; falls back to in-memory where OPFS is unavailable |
 | Input videos read lazily from disk (`BlobSource`); photos and overlay images decoded only while their clip is on screen | Memory stays flat no matter how large or how many the inputs are |
 | Encoder watchdog: a step that returns nothing for 20 s triggers one automatic retry with a compatible profile (realtime encoding, software video where offered, in-memory output) | Some devices' encoders hold frames back indefinitely; the export recovers instead of hanging |
 | Safari/iOS (WebKit) use the compatible profile from the start | WebKit's encoder can wait for more frames than the pipeline sends, and its on-disk writer is new; realtime mode returns every frame immediately |
-| Default export is full-quality H.264 (very-high bitrate); the file-size cap is opt-in | Quality is never reduced unless a cap is chosen. The cap sets the exact video bitrate to fit a hard target (e.g. 2 MB / 5 MB ad limits) without changing resolution; the UI shows the bitrate it will use and warns when a cap is too tight rather than degrading silently |
+| No compressor or file-size cap — the export is always best quality | Quality is never traded for size; the file is as good as the source allows |
 | Always H.264 (AVC) inside the MP4, never HEVC | The most widely compatible output — plays in every browser, QuickTime and editor |
+| Two downloads: the file as-made, or a repackaged standard H.264 MP4 (`transcodeH264`) | The repackage copies the already-H.264 streams losslessly (no quality change), producing a clean, in-memory, fully-compatible MP4 — only re-encoding if some input ever weren't H.264 |
 | Overlay image placed by free x/y position and size (`ImagePlacement`), dragged over the clip's first frame | Pixel-free, resolution-independent placement with a true preview, instead of a fixed grid |
 | Text-pill position is a normalised x/y anchor, snapped to a 5×5 grid in the UI | More placement choices without changing the engine; the grid size is one UI constant |
 | A voiceover can span a chosen run of clips (`voiceRanges`, by clip index → exact seconds) | One narration file often covers two or three clips in sequence; it plays across the run and fades at the end |

@@ -63,14 +63,14 @@ type VoiceRange = { id: string; track: AudioTrack; start: number; end: number };
 type Job =
   | { state: 'idle' }
   | { state: 'rendering'; progress: number; stage: string; startedAt: number; updatedAt: number }
-  | { state: 'done'; url: string; size: number; seconds: number }
+  | { state: 'done'; url: string; blob: Blob; size: number; seconds: number }
   | { state: 'error'; message: string };
 
 const CUSTOM_PRESET = 'Custom size (type width × height)';
 const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
-  '1080p, shape of first clip (recommended)': (first) => autoSize(first, 1080),
-  '720p, shape of first clip (fastest)': (first) => autoSize(first, 720),
-  'Original size, up to 4K (slower)': (first) => autoSize(first),
+  'Best quality — original size, up to 4K (recommended)': (first) => autoSize(first),
+  '1080p, shape of first clip (smaller file)': (first) => autoSize(first, 1080),
+  '720p, shape of first clip (smallest, fastest)': (first) => autoSize(first, 720),
   '1080p landscape (1920×1080)': () => ({ width: 1920, height: 1080 }),
   '720p landscape (1280×720)': () => ({ width: 1280, height: 720 }),
   '4K landscape (3840×2160)': () => ({ width: 3840, height: 2160 }),
@@ -83,27 +83,13 @@ const SIZE_PRESETS: Record<string, (first: ClipInfo) => Size> = {
   'Ad video — 1024×1024 (maximum)': () => ({ width: 1024, height: 1024 }),
 };
 const SIZE_GROUPS: [string, string[]][] = [
-  ['Match your clips', ['1080p, shape of first clip (recommended)', '720p, shape of first clip (fastest)', 'Original size, up to 4K (slower)']],
+  ['Match your clips', ['Best quality — original size, up to 4K (recommended)', '1080p, shape of first clip (smaller file)', '720p, shape of first clip (smallest, fastest)']],
   ['Custom', [CUSTOM_PRESET]],
   ['Landscape', ['1080p landscape (1920×1080)', '720p landscape (1280×720)', '4K landscape (3840×2160)']],
   ['Portrait', ['1080p portrait (1080×1920)', '720p portrait (720×1280)']],
   ['Instagram', ['Instagram square 1:1 (1080×1080)', 'Instagram portrait 4:5 (1080×1350)', 'Instagram story / Reel 9:16 (1080×1920)']],
   ['Ad video (square)', ['Ad video — 960×960 (required)', 'Ad video — 1024×1024 (maximum)']],
 ];
-
-/** File-size cap: the compressor fits the whole video under this many bytes, resolution unchanged. */
-type SizeTarget = 'none' | 'mobile' | 'desktop' | 'custom';
-const MB = 1024 * 1024;
-const SIZE_TARGET_LABELS: Record<SizeTarget, string> = {
-  none: 'No limit — best quality',
-  mobile: 'Mobile video — max 2 MB',
-  desktop: 'Desktop video — max 5 MB',
-  custom: 'Custom maximum (MB)…',
-};
-/** Must match the engine's CAP_AUDIO_BITRATE, so the on-screen estimate matches the real file. */
-const AUDIO_BITRATE = 128_000;
-const targetBytes = (t: SizeTarget, customMB: number): number | undefined =>
-  t === 'mobile' ? 2 * MB : t === 'desktop' ? 5 * MB : t === 'custom' ? Math.max(0.2, customMB) * MB : undefined;
 
 /** The text-pill position grid: more boxes than before, mapped to normalised x/y for the engine. */
 const PILL_GRID = 5;
@@ -154,7 +140,6 @@ const formatTime = (s: number) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 };
 const formatBytes = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(1)} MB`);
-const formatCap = (bytes: number) => `${Number.isInteger(bytes / MB) ? (bytes / MB).toFixed(0) : (bytes / MB).toFixed(1)} MB`;
 const readyBuffer = (track: AudioTrack | null) => (track?.status === 'ready' ? track.buffer : undefined);
 
 type AudioPickerProps = {
@@ -395,16 +380,18 @@ export default function App() {
   const [preset, setPreset] = useState(Object.keys(SIZE_PRESETS)[0]);
   const [custom, setCustom] = useState<Size>({ width: 1920, height: 1080 });
   const [quality, setQuality] = useState<Quality>('very-high');
-  const [sizeTarget, setSizeTarget] = useState<SizeTarget>('none');
-  const [customMB, setCustomMB] = useState(2);
   const [logoSeconds, setLogoSeconds] = useState(3);
-  const [fastFps, setFastFps] = useState(true);
+  // Default to matching the clips' frame rate — no frames are skipped, so motion stays at full quality.
+  const [fastFps, setFastFps] = useState(false);
   const [transitionSeconds, setTransitionSeconds] = useState(0.75);
   const [pillDefaults, setPillDefaults] = useState<PillStyle>(DEFAULT_PILL_STYLE);
   const [defaults, setDefaults] = useState<{ transition: Transition; motion: Motion }>({ transition: 'dissolve', motion: 'none' });
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // Optional H.264 repackage, made from the finished video only when the user asks for it.
+  const [h264, setH264] = useState<{ status: 'idle' | 'working' | 'error'; progress: number; message?: string }>({ status: 'idle', progress: 0 });
+  const h264Abort = useRef<AbortController | null>(null);
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
@@ -432,15 +419,6 @@ export default function App() {
   const sizeFor = (first: ClipInfo) => (preset === CUSTOM_PRESET ? customSize(custom.width, custom.height) : SIZE_PRESETS[preset](first));
   const outputSize = ready[0] ? sizeFor(ready[0].info) : null;
   const aspect = outputSize ? outputSize.width / outputSize.height : 16 / 9;
-
-  // File-size cap: compute the video bitrate it allows for this video, so we can show an honest estimate.
-  const maxBytes = targetBytes(sizeTarget, customMB);
-  const estVideoBps =
-    maxBytes && totalSeconds > 0 ? Math.floor((maxBytes * 8 * 0.94) / totalSeconds - AUDIO_BITRATE) : null;
-  const comfortableBps =
-    outputSize && fps ? (outputSize.width * outputSize.height) / (1280 * 720) * (fps / 30) * 1_300_000 : 0;
-  const capTooLow = estVideoBps !== null && estVideoBps < 120_000;
-  const capTight = estVideoBps !== null && !capTooLow && comfortableBps > 0 && estVideoBps < comfortableBps * 0.6;
 
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion'>(key: K) =>
@@ -660,7 +638,6 @@ export default function App() {
         logoSeconds,
         transitionSeconds,
         quality,
-        maxBytes,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
@@ -687,7 +664,8 @@ export default function App() {
         },
       });
       logo.close();
-      setJob({ state: 'done', url: URL.createObjectURL(result), size: result.size, seconds: (performance.now() - startedAt) / 1000 });
+      setH264({ status: 'idle', progress: 0 });
+      setJob({ state: 'done', url: URL.createObjectURL(result), blob: result, size: result.size, seconds: (performance.now() - startedAt) / 1000 });
     } catch (e) {
       console.error('Export failed', e);
       if (controller.signal.aborted) setJob({ state: 'idle' });
@@ -698,6 +676,35 @@ export default function App() {
     }
   };
 
+  /** Base download name, shared by the full-quality file and the smaller copy. */
+  const downloadName = (suffix = '') => `roothoot-video-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}${suffix}.mp4`;
+
+  /** Repackages the finished video to a standard H.264 MP4 (same quality) and downloads it. Optional. */
+  const downloadH264 = async () => {
+    if (job.state !== 'done' || h264.status === 'working') return;
+    const controller = new AbortController();
+    h264Abort.current = controller;
+    setH264({ status: 'working', progress: 0 });
+    try {
+      const { transcodeH264 } = await loadEngine();
+      const blob = await transcodeH264(job.blob, controller.signal, (progress) => setH264({ status: 'working', progress }));
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = downloadName('-h264');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 15000);
+      setH264({ status: 'idle', progress: 0 });
+    } catch (e) {
+      if (controller.signal.aborted) setH264({ status: 'idle', progress: 0 });
+      else setH264({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Could not create the H.264 file.' });
+    } finally {
+      h264Abort.current = null;
+    }
+  };
+
   const reset = () => {
     void loadEngine().then(({ clearExports }) => clearExports());
     clips.forEach(freeClip);
@@ -705,6 +712,7 @@ export default function App() {
     setVoiceover(null);
     setRanges([]);
     setMusic(null);
+    setH264({ status: 'idle', progress: 0 });
     setJob({ state: 'idle' });
   };
 
@@ -1180,55 +1188,20 @@ export default function App() {
             </label>
             <label>
               Quality
-              <select value={quality} disabled={busy || sizeTarget !== 'none'} onChange={(e) => setQuality(e.target.value as Quality)}>
+              <select value={quality} disabled={busy} onChange={(e) => setQuality(e.target.value as Quality)}>
                 {(Object.keys(QUALITY_LABELS) as Quality[]).map((q) => (
                   <option key={q} value={q}>{QUALITY_LABELS[q]}</option>
                 ))}
               </select>
-              {sizeTarget !== 'none' && <span className="meta">Set by the file-size limit below</span>}
             </label>
             <label>
               Frame rate
               <select value={fastFps ? 'fast' : 'smooth'} onChange={(e) => setFastFps(e.target.value === 'fast')} disabled={busy}>
-                <option value="fast">Up to 30 fps (faster export)</option>
-                <option value="smooth">Match clips, up to 60 fps (smoother)</option>
+                <option value="smooth">Match your clips — no frames skipped (best)</option>
+                <option value="fast">Cap at 30 fps (smaller, faster)</option>
               </select>
-            </label>
-            <label>
-              Maximum file size
-              <select value={sizeTarget} onChange={(e) => setSizeTarget(e.target.value as SizeTarget)} disabled={busy}>
-                {(Object.keys(SIZE_TARGET_LABELS) as SizeTarget[]).map((t) => (
-                  <option key={t} value={t}>{SIZE_TARGET_LABELS[t]}</option>
-                ))}
-              </select>
-              {sizeTarget === 'custom' && (
-                <span className="custom-size">
-                  <input
-                    className="text"
-                    type="number"
-                    inputMode="decimal"
-                    aria-label="Maximum size in MB"
-                    min={0.2}
-                    step={0.5}
-                    value={customMB}
-                    disabled={busy}
-                    onChange={(e) => setCustomMB(Math.max(0.2, Number(e.target.value) || 0.2))}
-                  />
-                  <span>MB</span>
-                </span>
-              )}
             </label>
           </div>
-
-          {maxBytes && estVideoBps !== null && (
-            <p className={`hint ${capTooLow ? 'error' : capTight ? 'warn' : 'muted'}`}>
-              {capTooLow
-                ? `A ${formatCap(maxBytes)} limit is very tight for a ${formatTime(totalSeconds)} video — the file may go slightly over, and quality will drop. Shorten the video or raise the limit.`
-                : capTight
-                  ? `Fitting under ${formatCap(maxBytes)} needs about ${Math.round(estVideoBps / 1000)} kbps of video, so some quality is traded for the smaller file. Shorten the video or raise the limit for full quality.`
-                  : `Targets about ${Math.round(estVideoBps / 1000)} kbps to stay under ${formatCap(maxBytes)} — no visible quality loss expected at this length. Resolution is unchanged.`}
-            </p>
-          )}
 
           {job.state === 'rendering' ? (
             <div className="progress-row">
@@ -1274,11 +1247,20 @@ export default function App() {
           </div>
           <video className="preview" src={job.url} controls playsInline />
           <div className="row">
-            <a className="button primary" href={job.url} download={`roothoot-video-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.mp4`}>
-              Download MP4
+            <a className="button primary" href={job.url} download={downloadName()}>
+              Download (best quality)
             </a>
+            {h264.status === 'working' ? (
+              <span className="button secondary" aria-busy="true">Preparing H.264… {Math.round(h264.progress * 100)}%</span>
+            ) : (
+              <button className="secondary" onClick={downloadH264}>Download as H.264</button>
+            )}
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
+          <p className="hint muted">
+            “Download (best quality)” gives the file exactly as made. “Download as H.264” packages it as a standard H.264 MP4 at the same quality — no change in quality, widest compatibility.
+          </p>
+          {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>
       )}
     </div>

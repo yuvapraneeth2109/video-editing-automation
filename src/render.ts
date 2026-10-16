@@ -12,6 +12,8 @@ import {
   BufferTarget,
   CanvasSink,
   CanvasSource,
+  Conversion,
+  ConversionCanceledError,
   getFirstEncodableAudioCodec,
   getFirstEncodableVideoCodec,
   Input,
@@ -46,15 +48,6 @@ const CLIP_VOICE_FADE_OUT = 0.3;
 const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
-/**
- * Audio bitrate when a file-size cap is set: 128 kbps AAC stereo is transparent for voice + music,
- * and a fixed value makes the size-budget maths exact. Without a cap, the best-quality setting is used.
- */
-const CAP_AUDIO_BITRATE = 128_000;
-/** Never drop below this video bitrate: beyond it the picture falls apart and the cap stops being worth it. */
-const MIN_VIDEO_BITRATE = 120_000;
-/** Leave this share of the cap for container overhead so the real file stays under the limit. */
-const SIZE_CAP_HEADROOM = 0.94;
 
 const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
@@ -98,8 +91,6 @@ export type RenderOptions = {
   logoSeconds: number;
   transitionSeconds: number;
   quality: Quality;
-  /** When set, the output is encoded to stay under this many bytes (resolution unchanged). */
-  maxBytes?: number;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
@@ -566,16 +557,9 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const { logoFrames, totalFrames } = plan;
   const totalSeconds = totalFrames / fps;
 
-  // Pick the video bitrate: either a quality preset (no quality loss), or the exact rate that fits the size cap.
-  const qualityBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
-  const capped = typeof options.maxBytes === 'number' && options.maxBytes > 0;
-  const audioBitrate = capped ? CAP_AUDIO_BITRATE : QUALITY_VERY_HIGH;
-  const videoBitrate: number | typeof QUALITY_VERY_HIGH = capped
-    ? Math.max(
-        MIN_VIDEO_BITRATE,
-        Math.floor((options.maxBytes! * 8 * SIZE_CAP_HEADROOM - CAP_AUDIO_BITRATE * totalSeconds) / Math.max(0.1, totalSeconds)),
-      )
-    : qualityBitrate;
+  // Quality preset → bitrate. Very-high is the best picture; nothing is capped or compressed down.
+  const videoBitrate = { 'very-high': QUALITY_VERY_HIGH, high: QUALITY_HIGH, medium: QUALITY_MEDIUM }[options.quality];
+  const audioBitrate = QUALITY_VERY_HIGH;
 
   const software = { hardwareAcceleration: 'prefer-software' as const, latencyMode: 'realtime' as const };
   const videoCodecOptions = { width, height, bitrate: videoBitrate };
@@ -901,5 +885,40 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     }
     await withTimeout(sink.discard(), 'Clean-up', 5_000).catch(() => {});
     throw error;
+  }
+}
+
+/**
+ * Repackages a finished MP4 into a clean, standard H.264 MP4 with no change in quality.
+ * The export is already H.264, so the video and audio streams are copied across untouched (lossless) —
+ * only re-encoding to H.264 if some input ever wasn't. Powers the optional "Download as H.264" button.
+ */
+export async function transcodeH264(
+  source: Blob,
+  signal?: AbortSignal,
+  onProgress?: (fraction: number) => void,
+): Promise<Blob> {
+  const input = new Input({ source: new BlobSource(source), formats: [MP4] });
+  const target = new BufferTarget();
+  const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+  const conversion = await Conversion.init({
+    input,
+    output,
+    // Target H.264 at top quality. Mediabunny copies the stream when it is already H.264 (no quality change),
+    // and only re-encodes if it somehow isn't. Audio is copied across untouched either way.
+    video: { codec: 'avc', quality: QUALITY_VERY_HIGH },
+  });
+  if (onProgress) conversion.onProgress = (p) => onProgress(p);
+  const onAbort = () => void conversion.cancel();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    await conversion.execute();
+    return new Blob([target.buffer!], { type: 'video/mp4' });
+  } catch (error) {
+    if (error instanceof ConversionCanceledError) throw new DOMException('Aborted', 'AbortError');
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    input.dispose();
   }
 }
