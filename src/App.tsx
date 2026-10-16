@@ -695,7 +695,8 @@ export default function App() {
     setH264({ status: 'working', progress: 0 });
     try {
       const { transcodeH264 } = await loadEngine();
-      const blob = await transcodeH264(job.blob, controller.signal, (progress) => setH264({ status: 'working', progress }));
+      // undefined maxBytes → the engine's 5 MB target.
+      const blob = await transcodeH264(job.blob, undefined, controller.signal, (progress) => setH264({ status: 'working', progress }));
       setH264({ status: 'ready', url: URL.createObjectURL(blob), size: blob.size });
     } catch (e) {
       if (controller.signal.aborted) setH264({ status: 'idle' });
@@ -1257,12 +1258,12 @@ export default function App() {
             ) : h264.status === 'working' ? (
               <span className="button secondary" aria-busy="true">Preparing H.264… {Math.round(h264.progress * 100)}%</span>
             ) : (
-              <button className="secondary" onClick={prepareH264}>Prepare H.264</button>
+              <button className="secondary" onClick={prepareH264}>Prepare H.264 (max 5 MB)</button>
             )}
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            “Download (best quality)” gives the file exactly as made. “Prepare H.264” makes a standard H.264 MP4 at identical quality — nothing is re-encoded, so it never pixelates.
+            “Download (best quality)” gives the file exactly as made. “Prepare H.264” makes an H.264 MP4 under 5 MB: if your video already fits it is copied at identical quality; if it is larger, the resolution is lowered just enough to keep it smooth — never pixelated.
             {h264.status === 'ready' ? ' Your file is ready — click “Download H.264”.' : ''}
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}

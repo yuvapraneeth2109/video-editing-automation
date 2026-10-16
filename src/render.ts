@@ -49,6 +49,18 @@ const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
 
+/** The optional "Download as H.264" button keeps the file under this many bytes. */
+const H264_MAX_BYTES = 5 * 1024 * 1024;
+/** Audio is copied (not re-encoded) into the H.264 file; reserved from the budget as a safe upper bound. */
+const H264_AUDIO_RESERVE = 256_000;
+/** Floor for the H.264 video bitrate when fitting the budget. */
+const H264_MIN_VIDEO_BITRATE = 300_000;
+/**
+ * Target H.264 bits per pixel per frame for a clean, block-free picture. When a video is too big for 5 MB,
+ * the resolution is lowered until its bitrate meets this — so the result stays smooth, never pixelated.
+ */
+const H264_TARGET_BPP = 0.11;
+
 const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
@@ -889,13 +901,18 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 }
 
 /**
- * Produces the optional "Download as H.264" file: a clean, standard H.264 MP4 at identical quality.
- * The export is already H.264, so the video and audio streams are copied across untouched — nothing is
- * re-encoded, so nothing can pixelate, and the resolution and quality are exactly the same as the master.
- * A stall watchdog guards against the rare case where the step stops responding.
+ * Produces the optional "Download as H.264" file, a standard H.264 MP4 kept under `maxBytes` (5 MB by default).
+ *
+ * - If the finished video already fits, its streams are copied across untouched — identical quality, full resolution.
+ * - If it is larger, the picture is kept SMOOTH rather than pixelated: the resolution is lowered just enough that the
+ *   bitrate the budget allows stays well above the blocking threshold, then the video is re-encoded at that size.
+ *   A lower resolution looks clean and soft; it never produces the blocky pixelation of squeezing bitrate at full size.
+ *
+ * Uses a software encoder and a stall watchdog on Safari/WebKit, whose hardware encoder can hang.
  */
 export async function transcodeH264(
   source: Blob,
+  maxBytes = H264_MAX_BYTES,
   signal?: AbortSignal,
   onProgress?: (fraction: number) => void,
 ): Promise<Blob> {
@@ -903,9 +920,48 @@ export async function transcodeH264(
   try {
     const target = new BufferTarget();
     const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
-    // codec 'avc' with copy (the default): an already-H.264 stream is copied losslessly; `quality` is only
-    // used in the rare event some input ever weren't H.264 and had to be transcoded.
-    const conversion = await Conversion.init({ input, output, video: { codec: 'avc', quality: QUALITY_VERY_HIGH } });
+
+    let video: {
+      codec: 'avc';
+      quality?: typeof QUALITY_VERY_HIGH;
+      width?: number;
+      height?: number;
+      fit?: 'contain';
+      bitrate?: number;
+      keyFrameInterval?: number;
+      hardwareAcceleration?: 'prefer-software';
+    };
+    if (source.size <= maxBytes) {
+      // Already small enough → copy the already-H.264 streams untouched (identical quality, full resolution).
+      video = { codec: 'avc', quality: QUALITY_VERY_HIGH };
+    } else {
+      const track = (await input.getPrimaryVideoTrack())!;
+      const [w, h, duration, metrics] = await Promise.all([
+        track.getDisplayWidth(),
+        track.getDisplayHeight(),
+        input.computeDuration(),
+        track.computeFrameRateMetrics(),
+      ]);
+      const dur = Math.max(0.1, duration);
+      const fps = metrics.bestGuessFrameRate > 0 ? metrics.bestGuessFrameRate : 30;
+      // 0.88 leaves headroom for container overhead and variable-bitrate overshoot, so the file lands under the limit.
+      const videoBitrate = Math.max(H264_MIN_VIDEO_BITRATE, Math.floor((maxBytes * 8 * 0.88 - H264_AUDIO_RESERVE * dur) / dur));
+      // The most pixels this bitrate can carry cleanly (no blocking); scale the picture down to it if needed.
+      const cleanPixels = videoBitrate / (fps * H264_TARGET_BPP);
+      const scale = Math.min(1, Math.sqrt(cleanPixels / (w * h)));
+      const outW = toEven(w * scale);
+      const outH = toEven(h * scale);
+      video = {
+        codec: 'avc',
+        bitrate: videoBitrate,
+        keyFrameInterval: 2,
+        ...(scale < 1 ? { width: outW, height: outH, fit: 'contain' as const } : {}),
+        ...(IS_WEBKIT ? { hardwareAcceleration: 'prefer-software' as const } : {}),
+      };
+    }
+
+    // Audio is copied across untouched (not re-encoded), so its quality is unchanged either way.
+    const conversion = await Conversion.init({ input, output, video });
 
     // Watchdog: if progress stops for 25 s, cancel instead of hanging.
     let lastTick = Date.now();
