@@ -49,6 +49,13 @@ const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
 
+/** The optional "Download as H.264" button fits the file under this many bytes (resolution unchanged). */
+const H264_MAX_BYTES = 5 * 1024 * 1024;
+/** Audio is copied (not re-encoded) into the H.264 file; this is reserved from the budget as a safe upper bound. */
+const H264_AUDIO_RESERVE = 256_000;
+/** Floor for the re-encoded H.264 video bitrate, so a very tight target never produces a broken file. */
+const H264_MIN_VIDEO_BITRATE = 200_000;
+
 const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
@@ -889,36 +896,70 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 }
 
 /**
- * Repackages a finished MP4 into a clean, standard H.264 MP4 with no change in quality.
- * The export is already H.264, so the video and audio streams are copied across untouched (lossless) —
- * only re-encoding to H.264 if some input ever wasn't. Powers the optional "Download as H.264" button.
+ * Produces the optional "Download as H.264" file: a standard H.264 MP4 kept under `maxBytes` (5 MB by default),
+ * at the SAME resolution. If the finished video already fits, its streams are copied across untouched — so the
+ * quality is identical. If it is larger, the video is re-encoded to H.264 just small enough to fit, with the
+ * audio copied over. Uses a software encoder and a stall watchdog on Safari/WebKit, which can hang the hardware one.
  */
 export async function transcodeH264(
   source: Blob,
+  maxBytes = H264_MAX_BYTES,
   signal?: AbortSignal,
   onProgress?: (fraction: number) => void,
 ): Promise<Blob> {
   const input = new Input({ source: new BlobSource(source), formats: [MP4] });
-  const target = new BufferTarget();
-  const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
-  const conversion = await Conversion.init({
-    input,
-    output,
-    // Target H.264 at top quality. Mediabunny copies the stream when it is already H.264 (no quality change),
-    // and only re-encodes if it somehow isn't. Audio is copied across untouched either way.
-    video: { codec: 'avc', quality: QUALITY_VERY_HIGH },
-  });
-  if (onProgress) conversion.onProgress = (p) => onProgress(p);
-  const onAbort = () => void conversion.cancel();
-  signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    await conversion.execute();
-    return new Blob([target.buffer!], { type: 'video/mp4' });
-  } catch (error) {
-    if (error instanceof ConversionCanceledError) throw new DOMException('Aborted', 'AbortError');
-    throw error;
+    const target = new BufferTarget();
+    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+
+    // Already small enough → copy everything (no re-encode, identical quality). Otherwise fit the video to the budget.
+    const fits = source.size <= maxBytes;
+    let video: { codec: 'avc'; bitrate?: number; keyFrameInterval?: number; hardwareAcceleration?: 'prefer-software' };
+    if (fits) {
+      video = { codec: 'avc' };
+    } else {
+      const duration = Math.max(0.1, await input.computeDuration());
+      // 0.88 leaves headroom for container overhead and the encoder's variable-bitrate overshoot, so the
+      // real file lands safely under the limit rather than just touching it.
+      const bitrate = Math.max(
+        H264_MIN_VIDEO_BITRATE,
+        Math.floor((maxBytes * 8 * 0.88 - H264_AUDIO_RESERVE * duration) / duration),
+      );
+      video = { codec: 'avc', bitrate, keyFrameInterval: 2, ...(IS_WEBKIT ? { hardwareAcceleration: 'prefer-software' as const } : {}) };
+    }
+
+    const conversion = await Conversion.init({ input, output, video });
+
+    // Watchdog: Safari's encoder can stop returning frames. If progress stops for 25 s, cancel instead of hanging.
+    let lastTick = Date.now();
+    conversion.onProgress = (p) => {
+      lastTick = Date.now();
+      onProgress?.(p);
+    };
+    const onAbort = () => void conversion.cancel();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastTick > 25_000) {
+        clearInterval(watchdog);
+        void conversion.cancel();
+      }
+    }, 5_000);
+
+    try {
+      await conversion.execute();
+      return new Blob([target.buffer!], { type: 'video/mp4' });
+    } catch (error) {
+      if (error instanceof ConversionCanceledError) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        // Not a user cancel → the watchdog fired (Safari encoder hung).
+        throw new Error('The H.264 encoder stopped responding. Use the “Download (best quality)” button, or export in Chrome or Edge.');
+      }
+      throw error;
+    } finally {
+      clearInterval(watchdog);
+      signal?.removeEventListener('abort', onAbort);
+    }
   } finally {
-    signal?.removeEventListener('abort', onAbort);
     input.dispose();
   }
 }

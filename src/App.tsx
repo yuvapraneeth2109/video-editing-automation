@@ -389,8 +389,15 @@ export default function App() {
   const [job, setJob] = useState<Job>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  // Optional H.264 repackage, made from the finished video only when the user asks for it.
-  const [h264, setH264] = useState<{ status: 'idle' | 'working' | 'error'; progress: number; message?: string }>({ status: 'idle', progress: 0 });
+  // Optional H.264 file (max 5 MB), prepared from the finished video only when the user asks for it.
+  // Two steps — prepare, then a real download link — so the download works in Safari (which blocks
+  // a programmatic download triggered after an await, outside the original click).
+  const [h264, setH264] = useState<
+    | { status: 'idle' }
+    | { status: 'working'; progress: number }
+    | { status: 'ready'; url: string; size: number }
+    | { status: 'error'; message: string }
+  >({ status: 'idle' });
   const h264Abort = useRef<AbortController | null>(null);
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
@@ -432,6 +439,7 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', warn);
   }, [busy]);
   useEffect(() => () => void (job.state === 'done' && URL.revokeObjectURL(job.url)), [job]);
+  useEffect(() => () => void (h264.status === 'ready' && URL.revokeObjectURL(h264.url)), [h264]);
   // Load the engine early, and remove export files left on disk by an earlier visit.
   useEffect(() => void loadEngine().then(({ clearExports }) => clearExports()), []);
 
@@ -664,7 +672,7 @@ export default function App() {
         },
       });
       logo.close();
-      setH264({ status: 'idle', progress: 0 });
+      setH264({ status: 'idle' });
       setJob({ state: 'done', url: URL.createObjectURL(result), blob: result, size: result.size, seconds: (performance.now() - startedAt) / 1000 });
     } catch (e) {
       console.error('Export failed', e);
@@ -679,27 +687,20 @@ export default function App() {
   /** Base download name, shared by the full-quality file and the smaller copy. */
   const downloadName = (suffix = '') => `roothoot-video-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}${suffix}.mp4`;
 
-  /** Repackages the finished video to a standard H.264 MP4 (same quality) and downloads it. Optional. */
-  const downloadH264 = async () => {
+  /** Prepares the optional H.264 file (max 5 MB, same resolution). The user then clicks a real download link. */
+  const prepareH264 = async () => {
     if (job.state !== 'done' || h264.status === 'working') return;
     const controller = new AbortController();
     h264Abort.current = controller;
     setH264({ status: 'working', progress: 0 });
     try {
       const { transcodeH264 } = await loadEngine();
-      const blob = await transcodeH264(job.blob, controller.signal, (progress) => setH264({ status: 'working', progress }));
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = downloadName('-h264');
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 15000);
-      setH264({ status: 'idle', progress: 0 });
+      // undefined maxBytes → the engine's 5 MB target.
+      const blob = await transcodeH264(job.blob, undefined, controller.signal, (progress) => setH264({ status: 'working', progress }));
+      setH264({ status: 'ready', url: URL.createObjectURL(blob), size: blob.size });
     } catch (e) {
-      if (controller.signal.aborted) setH264({ status: 'idle', progress: 0 });
-      else setH264({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Could not create the H.264 file.' });
+      if (controller.signal.aborted) setH264({ status: 'idle' });
+      else setH264({ status: 'error', message: e instanceof Error ? e.message : 'Could not create the H.264 file.' });
     } finally {
       h264Abort.current = null;
     }
@@ -712,7 +713,7 @@ export default function App() {
     setVoiceover(null);
     setRanges([]);
     setMusic(null);
-    setH264({ status: 'idle', progress: 0 });
+    setH264({ status: 'idle' });
     setJob({ state: 'idle' });
   };
 
@@ -1250,15 +1251,21 @@ export default function App() {
             <a className="button primary" href={job.url} download={downloadName()}>
               Download (best quality)
             </a>
-            {h264.status === 'working' ? (
+            {h264.status === 'ready' ? (
+              <a className="button secondary" href={h264.url} download={downloadName('-h264')}>
+                Download H.264 ({formatBytes(h264.size)})
+              </a>
+            ) : h264.status === 'working' ? (
               <span className="button secondary" aria-busy="true">Preparing H.264… {Math.round(h264.progress * 100)}%</span>
             ) : (
-              <button className="secondary" onClick={downloadH264}>Download as H.264</button>
+              <button className="secondary" onClick={prepareH264}>Prepare H.264 (max 5 MB)</button>
             )}
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            “Download (best quality)” gives the file exactly as made. “Download as H.264” packages it as a standard H.264 MP4 at the same quality — no change in quality, widest compatibility.
+            “Download (best quality)” gives the file exactly as made. “Prepare H.264” makes a standard H.264 MP4 kept under 5 MB
+            {job.size <= 5 * 1024 * 1024 ? ' — your video already fits, so it is copied at identical quality.' : ' — it fits the video to 5 MB at the same resolution.'}
+            {h264.status === 'ready' ? ' Your file is ready — click “Download H.264”.' : ''}
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>
