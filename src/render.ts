@@ -49,13 +49,6 @@ const OVERLAY_FADE = 0.4;
 /** Zoom in/out moves between 100% and this scale over the clip. */
 const MOTION_SCALE = 1.12;
 
-/** The optional "Download as H.264" button fits the file under this many bytes (resolution unchanged). */
-const H264_MAX_BYTES = 5 * 1024 * 1024;
-/** Audio is copied (not re-encoded) into the H.264 file; this is reserved from the budget as a safe upper bound. */
-const H264_AUDIO_RESERVE = 256_000;
-/** Floor for the re-encoded H.264 video bitrate, so a very tight target never produces a broken file. */
-const H264_MIN_VIDEO_BITRATE = 200_000;
-
 const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
 
@@ -896,14 +889,13 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 }
 
 /**
- * Produces the optional "Download as H.264" file: a standard H.264 MP4 kept under `maxBytes` (5 MB by default),
- * at the SAME resolution. If the finished video already fits, its streams are copied across untouched — so the
- * quality is identical. If it is larger, the video is re-encoded to H.264 just small enough to fit, with the
- * audio copied over. Uses a software encoder and a stall watchdog on Safari/WebKit, which can hang the hardware one.
+ * Produces the optional "Download as H.264" file: a clean, standard H.264 MP4 at identical quality.
+ * The export is already H.264, so the video and audio streams are copied across untouched — nothing is
+ * re-encoded, so nothing can pixelate, and the resolution and quality are exactly the same as the master.
+ * A stall watchdog guards against the rare case where the step stops responding.
  */
 export async function transcodeH264(
   source: Blob,
-  maxBytes = H264_MAX_BYTES,
   signal?: AbortSignal,
   onProgress?: (fraction: number) => void,
 ): Promise<Blob> {
@@ -911,26 +903,11 @@ export async function transcodeH264(
   try {
     const target = new BufferTarget();
     const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+    // codec 'avc' with copy (the default): an already-H.264 stream is copied losslessly; `quality` is only
+    // used in the rare event some input ever weren't H.264 and had to be transcoded.
+    const conversion = await Conversion.init({ input, output, video: { codec: 'avc', quality: QUALITY_VERY_HIGH } });
 
-    // Already small enough → copy everything (no re-encode, identical quality). Otherwise fit the video to the budget.
-    const fits = source.size <= maxBytes;
-    let video: { codec: 'avc'; bitrate?: number; keyFrameInterval?: number; hardwareAcceleration?: 'prefer-software' };
-    if (fits) {
-      video = { codec: 'avc' };
-    } else {
-      const duration = Math.max(0.1, await input.computeDuration());
-      // 0.88 leaves headroom for container overhead and the encoder's variable-bitrate overshoot, so the
-      // real file lands safely under the limit rather than just touching it.
-      const bitrate = Math.max(
-        H264_MIN_VIDEO_BITRATE,
-        Math.floor((maxBytes * 8 * 0.88 - H264_AUDIO_RESERVE * duration) / duration),
-      );
-      video = { codec: 'avc', bitrate, keyFrameInterval: 2, ...(IS_WEBKIT ? { hardwareAcceleration: 'prefer-software' as const } : {}) };
-    }
-
-    const conversion = await Conversion.init({ input, output, video });
-
-    // Watchdog: Safari's encoder can stop returning frames. If progress stops for 25 s, cancel instead of hanging.
+    // Watchdog: if progress stops for 25 s, cancel instead of hanging.
     let lastTick = Date.now();
     conversion.onProgress = (p) => {
       lastTick = Date.now();
@@ -951,8 +928,8 @@ export async function transcodeH264(
     } catch (error) {
       if (error instanceof ConversionCanceledError) {
         if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        // Not a user cancel → the watchdog fired (Safari encoder hung).
-        throw new Error('The H.264 encoder stopped responding. Use the “Download (best quality)” button, or export in Chrome or Edge.');
+        // Not a user cancel → the watchdog fired.
+        throw new Error('The H.264 step stopped responding. Use the “Download (best quality)” button, or try Chrome or Edge.');
       }
       throw error;
     } finally {
