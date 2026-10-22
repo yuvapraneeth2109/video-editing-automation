@@ -17,8 +17,19 @@ export type PillPosition = { x: number; y: number };
 /** How a clip hands over to the next one. */
 export type Transition = 'cut' | 'dissolve' | 'fade' | 'slide' | 'wipe';
 
-/** Slow camera move applied across a whole clip. */
-export type Motion = 'none' | 'zoom-in' | 'zoom-out' | 'zoom-in-out';
+/** Slow camera move applied across a whole clip: a zoom, or a pan in one direction. */
+export type Motion =
+  | 'none'
+  | 'zoom-in'
+  | 'zoom-out'
+  | 'zoom-in-out'
+  | 'pan-left'
+  | 'pan-right'
+  | 'pan-up'
+  | 'pan-down';
+
+/** How far / how fast the zoom or pan moves. */
+export type MotionSpeed = 'slow' | 'medium' | 'fast';
 
 export const TRANSITION_LABELS: Record<Transition, string> = {
   cut: 'Cut',
@@ -33,6 +44,23 @@ export const MOTION_LABELS: Record<Motion, string> = {
   'zoom-in': 'Zoom in',
   'zoom-out': 'Zoom out',
   'zoom-in-out': 'Zoom in, then out',
+  'pan-left': 'Pan left',
+  'pan-right': 'Pan right',
+  'pan-up': 'Pan up',
+  'pan-down': 'Pan down',
+};
+
+export const MOTION_SPEED_LABELS: Record<MotionSpeed, string> = {
+  slow: 'Slow',
+  medium: 'Medium',
+  fast: 'Fast',
+};
+
+/** Peak scale factor for a zoom, and the amount of overscan a pan travels across. */
+export const MOTION_SPEED_SCALE: Record<MotionSpeed, number> = {
+  slow: 1.07,
+  medium: 1.14,
+  fast: 1.24,
 };
 
 /** Fonts for text pills: installed on virtually every Mac, Windows PC and phone, so no download is needed. */

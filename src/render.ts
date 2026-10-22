@@ -25,9 +25,11 @@ import {
 } from 'mediabunny';
 
 import {
+  MOTION_SPEED_SCALE,
   planTimeline,
   type ClipInfo,
   type Motion,
+  type MotionSpeed,
   type PillPosition,
   type PlannedClip,
   type Quality,
@@ -46,8 +48,6 @@ const VOICE_FADE_OUT = 0.4;
 const CLIP_VOICE_FADE_OUT = 0.3;
 /** Text pills and images fade in and out over this many seconds. */
 const OVERLAY_FADE = 0.4;
-/** Zoom in/out moves between 100% and this scale over the clip. */
-const MOTION_SCALE = 1.12;
 
 /** The optional "Download as H.264" button keeps the file under this many bytes. */
 const H264_MAX_BYTES = 5 * 1024 * 1024;
@@ -79,10 +79,15 @@ export type ImagePlacement = { x: number; y: number; scale: number };
 
 export type RenderClip = {
   file: File;
+  /** `info.duration` is the PLAY length (after trimming for videos); a video source is `trimStart`s longer. */
   info: ClipInfo;
   /** True for photos: shown still for `info.duration` seconds instead of decoding video. */
   photo: boolean;
   motion: Motion;
+  /** How far / fast the zoom or pan moves. */
+  motionSpeed: MotionSpeed;
+  /** Seconds into the source video where this clip starts playing (0 = from the beginning). */
+  trimStart: number;
   /** Transition into the next clip (ignored on the last clip). */
   transition: Transition;
   /** Plays from the start of this clip and is cut at its end. */
@@ -103,16 +108,22 @@ export type RenderOptions = {
   logoSeconds: number;
   transitionSeconds: number;
   quality: Quality;
+  /** A watermark/logo shown at a fixed spot on every clip frame, for the whole video. */
+  logoOverlay?: { file: File } & ImagePlacement;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
   clipVolume: number;
   voiceVolume: number;
   musicVolume: number;
   /** One voiceover for the whole video: starts with the first clip and plays once. */
   voiceover?: AudioBuffer;
+  /** Extra seconds to delay the whole-video voiceover past the start of the clips. */
+  voiceStartOffset?: number;
   /** Voiceovers that each cover a run of clips. */
   voiceRanges?: VoiceRange[];
   /** Plays under the whole video, looping if shorter, with fades at both ends. */
   music?: AudioBuffer;
+  /** Seconds from the start of the video where the music begins (silent before). */
+  musicStartOffset?: number;
   signal: AbortSignal;
   /** `stage` names what is being rendered, e.g. "Clip 2 of 5". */
   onProgress: (fraction: number, stage: string) => void;
@@ -417,12 +428,14 @@ const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, widt
   const boxH = lines.length * lineHeight + padY * 2;
   const radius = Math.min(boxH / 2, fontSize * 1.1);
 
-  // Position the box anywhere in the safe area: (0,0) hugs the top-left margin, (1,1) the bottom-right.
-  const availW = Math.max(0, width - margin * 2 - boxW);
-  const availH = Math.max(0, height - margin * 2 - boxH);
-  const x = margin + clamp01(position.x) * availW;
-  const y = margin + clamp01(position.y) * availH;
-  const textX = x + boxW / 2;
+  // x/y are the pill's CENTRE as a fraction of the frame; clamp so the box always stays fully on-screen.
+  const halfW = boxW / 2;
+  const halfH = boxH / 2;
+  const cx = Math.min(width - halfW - margin, Math.max(halfW + margin, clamp01(position.x) * width));
+  const cy = Math.min(height - halfH - margin, Math.max(halfH + margin, clamp01(position.y) * height));
+  const x = cx - halfW;
+  const y = cy - halfH;
+  const textX = cx;
 
   return (alpha: number) => {
     if (alpha <= 0) return;
@@ -469,16 +482,27 @@ const createImageOverlay = (
 /** Smooth start and end for transitions and camera moves. */
 const ease = (t: number) => t * t * (3 - 2 * t);
 
-/** How one clip is drawn on a given frame. */
-type Layer = { alpha: number; offsetX: number; reveal: number; scale: number };
+/** How one clip is drawn on a given frame. offsetX is the whole-clip slide; panX/panY move only the video frame. */
+type Layer = { alpha: number; offsetX: number; reveal: number; scale: number; panX: number; panY: number };
 
-/** Works out a clip's opacity, position, wipe and zoom for local frame `k`. */
-function layerAt(clip: PlannedClip, motion: Motion, k: number): Layer {
-  const layer: Layer = { alpha: 1, offsetX: 0, reveal: 1, scale: 1 };
+/** Works out a clip's opacity, slide, wipe, zoom and pan for local frame `k`. `speedScale` sets zoom/pan amount. */
+function layerAt(clip: PlannedClip, motion: Motion, speedScale: number, k: number): Layer {
+  const layer: Layer = { alpha: 1, offsetX: 0, reveal: 1, scale: 1, panX: 0, panY: 0 };
   const t = clip.frames > 1 ? k / (clip.frames - 1) : 0;
-  if (motion === 'zoom-in') layer.scale = 1 + (MOTION_SCALE - 1) * ease(t);
-  if (motion === 'zoom-out') layer.scale = MOTION_SCALE - (MOTION_SCALE - 1) * ease(t);
-  if (motion === 'zoom-in-out') layer.scale = 1 + (MOTION_SCALE - 1) * ease(t < 0.5 ? t * 2 : 2 - t * 2);
+  const z = speedScale;
+  if (motion === 'zoom-in') layer.scale = 1 + (z - 1) * ease(t);
+  else if (motion === 'zoom-out') layer.scale = z - (z - 1) * ease(t);
+  else if (motion === 'zoom-in-out') layer.scale = 1 + (z - 1) * ease(t < 0.5 ? t * 2 : 2 - t * 2);
+  else if (motion.startsWith('pan-')) {
+    // Zoom in a little so there is room to move, then travel across that overscan (never showing an edge).
+    layer.scale = z;
+    const shift = (z - 1) / 2;
+    const p = ease(t);
+    if (motion === 'pan-left') layer.panX = -shift + 2 * shift * p;
+    if (motion === 'pan-right') layer.panX = shift - 2 * shift * p;
+    if (motion === 'pan-up') layer.panY = -shift + 2 * shift * p;
+    if (motion === 'pan-down') layer.panY = shift - 2 * shift * p;
+  }
 
   if (k < clip.inFrames) {
     const p = ease((k + 0.5) / clip.inFrames);
@@ -609,11 +633,14 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const clipsEnd = totalFrames - logoFrames;
   const audioChunkFrames = Math.max(1, Math.round(AUDIO_CHUNK_SECONDS * fps));
 
-  const voiceStart = logoFrames / fps;
-  const musicFadeOutStart = Math.max(MUSIC_FADE_IN, totalSeconds - MUSIC_FADE_OUT);
+  const voiceStart = logoFrames / fps + Math.max(0, options.voiceStartOffset ?? 0);
+  const musicStart = Math.max(0, options.musicStartOffset ?? 0);
+  const musicFadeInEnd = musicStart + MUSIC_FADE_IN;
+  const musicFadeOutStart = Math.max(musicFadeInEnd, totalSeconds - MUSIC_FADE_OUT);
   const musicEnvelope: Envelope = [
     [0, 0],
-    [MUSIC_FADE_IN, 1],
+    [musicStart, 0],
+    [musicFadeInEnd, 1],
     [musicFadeOutStart, 1],
     [Math.max(musicFadeOutStart, totalSeconds), 0],
   ];
@@ -706,12 +733,14 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     for (const range of rangeVoices) {
       scheduleVoice(context, bus, range.buffer, range.start, range.end, VOICE_FADE_OUT, from, to);
     }
-    if (music && musicVolume > 0) {
+    if (music && musicVolume > 0 && to > musicStart) {
       const source = new AudioBufferSourceNode(context, { buffer: music, loop: true });
       const gain = new GainNode(context);
       applyEnvelope(gain.gain, musicEnvelope, from, to, musicVolume);
       source.connect(gain).connect(bus);
-      source.start(0, from % music.duration);
+      // Music begins at musicStart on the timeline, then loops.
+      if (from >= musicStart) source.start(0, (from - musicStart) % music.duration);
+      else source.start(musicStart - from, 0);
     }
 
     return context.startRendering();
@@ -759,19 +788,21 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     return { next: async () => still, close: () => {} };
   };
 
-  /** A video file: frames decoded in order (letterboxed, rotation applied), its sound fed to the mixer. */
-  const videoFileSource = async (file: File, frames: number, segment: Segment) => {
+  /** A video file: frames decoded in order from `trimStart` (letterboxed, rotation applied), its sound fed to the mixer. */
+  const videoFileSource = async (file: File, frames: number, segment: Segment, trimStart: number) => {
     const input = openInput(file);
     const videoTrack = (await input.getPrimaryVideoTrack())!;
     const audioTrack = await input.getPrimaryAudioTrack();
     const origin = await input.getFirstTimestamp();
+    const from = origin + trimStart;
     if (clipVolume > 0 && audioTrack && (await audioTrack.canDecode())) {
-      segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(origin), origin);
+      // Read the clip's audio starting at the trim point so sound and picture stay aligned.
+      segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(from), from);
     }
     const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
     const canvases = sink.canvasesAtTimestamps(
       (function* () {
-        for (let i = 0; i < frames; i++) yield origin + i / fps;
+        for (let i = 0; i < frames; i++) yield from + i / fps;
       })(),
     );
     return {
@@ -799,9 +830,10 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
       voiceover: clip.voiceover,
     };
-    const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment);
+    const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment, clip.trimStart);
     activeSegments.add(segment);
 
+    const speedScale = MOTION_SPEED_SCALE[clip.motionSpeed];
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
@@ -812,23 +844,27 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     let k = 0;
 
     return {
-      /** Draws this clip's next frame onto the output canvas, applying transition and zoom. */
+      /** Draws this clip's next frame onto the output canvas, applying transition, zoom and pan. */
       async draw() {
         const frame = await source.next();
-        const { alpha, offsetX, reveal, scale } = layerAt(planned, clip.motion, k);
+        const { alpha, offsetX, reveal, scale, panX, panY } = layerAt(planned, clip.motion, speedScale, k);
 
         ctx.save();
         ctx.globalAlpha = alpha;
-        ctx.translate(offsetX * width, 0);
+        ctx.translate(offsetX * width, 0); // whole-clip slide (transition)
         if (reveal < 1) {
           ctx.beginPath();
           ctx.rect(0, 0, reveal * width, height);
           ctx.clip();
         }
         if (frame) {
+          // Zoom and pan move only the video frame; pills and images stay put over it.
+          ctx.save();
+          ctx.translate(panX * width, panY * height);
           const w = width * scale;
           const h = height * scale;
           ctx.drawImage(frame, (width - w) / 2, (height - h) / 2, w, h);
+          ctx.restore();
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
         drawImages.forEach((draw) => draw(overlayAlpha));
@@ -854,6 +890,12 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const renderClips = async () => {
     const open: OpenClip[] = [];
     let nextClip = 0;
+    // A watermark/logo shown at a fixed spot on every clip frame, for the whole video (optional).
+    const watermark = options.logoOverlay ? await decodeImage(options.logoOverlay.file, OVERLAY_MAX_EDGE) : null;
+    const drawWatermark =
+      watermark && options.logoOverlay
+        ? createImageOverlay(ctx, watermark, { x: options.logoOverlay.x, y: options.logoOverlay.y, scale: options.logoOverlay.scale }, width, height)
+        : null;
     try {
       for (let f = logoFrames; f < clipsEnd; f++) {
         while (nextClip < clips.length && plan.clips[nextClip].start === f) {
@@ -864,6 +906,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         ctx.fillStyle = '#000000';
         ctx.fillRect(0, 0, width, height);
         for (const clip of open) await clip.draw(); // older clip first, the incoming one on top
+        drawWatermark?.(1); // on top of everything, fixed position, every frame
         await addVideoFrame();
 
         const finished = open.filter((c) => c.finished);
@@ -876,6 +919,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       await syncAudio();
     } finally {
       open.forEach((c) => c.close());
+      watermark?.close();
     }
   };
 
