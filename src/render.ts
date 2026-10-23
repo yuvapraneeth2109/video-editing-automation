@@ -73,6 +73,9 @@ export type TextPill = {
 /** Where and how large an overlay image sits: x/y are its centre (0–1 of the frame), scale its width (0–1). */
 export type ImagePlacement = { x: number; y: number; scale: number };
 
+/** A kept span of an audio file, in seconds. `end` ≤ `start` or ≥ the file length means "to the end". */
+export type AudioTrim = { start: number; end: number };
+
 export type RenderClip = {
   file: File;
   /** `info.duration` is the PLAY length (after trimming for videos); a video source is `trimStart`s longer. */
@@ -90,13 +93,16 @@ export type RenderClip = {
   voiceover?: AudioBuffer;
   /** Seconds to delay this clip's voiceover past the start of the clip. */
   voiceOffset?: number;
-  pill?: TextPill;
+  /** Which part of the voiceover audio to use (the rest is discarded before playback). */
+  voiceTrim?: AudioTrim;
+  /** Any number of captions over this clip, each with its own text, style, size, position and on-screen window. */
+  pills: TextPill[];
   /** Images shown over this clip (later ones on top), each at its own position and size. */
   images: ({ file: File } & ImagePlacement)[];
 };
 
 /** One voiceover that spans a run of clips, by their position in `clips` (inclusive). */
-export type VoiceRange = { buffer: AudioBuffer; start: number; end: number; startOffset?: number };
+export type VoiceRange = { buffer: AudioBuffer; start: number; end: number; startOffset?: number; trim?: AudioTrim };
 
 export type RenderOptions = {
   clips: RenderClip[];
@@ -114,6 +120,8 @@ export type RenderOptions = {
   musicVolume: number;
   /** One voiceover for the whole video: starts with the first clip and plays once. */
   voiceover?: AudioBuffer;
+  /** Which part of the whole-video voiceover audio to use. */
+  voiceTrim?: AudioTrim;
   /** Extra seconds to delay the whole-video voiceover past the start of the clips. */
   voiceStartOffset?: number;
   /** Voiceovers that each cover a run of clips. */
@@ -334,6 +342,24 @@ async function createTarget(useDisk: boolean) {
       discard: async () => {},
     };
   }
+}
+
+/**
+ * Returns a new AudioBuffer holding only the span [trim.start, trim.end) of `buffer`. An end ≤ start or
+ * ≥ the buffer length (and an undefined trim) means "use everything", in which case the original is returned.
+ */
+function sliceBuffer(buffer: AudioBuffer, trim?: AudioTrim): AudioBuffer {
+  if (!trim) return buffer;
+  const sr = buffer.sampleRate;
+  const s = Math.max(0, Math.min(buffer.length, Math.floor(trim.start * sr)));
+  const e = trim.end > trim.start && trim.end * sr < buffer.length ? Math.floor(trim.end * sr) : buffer.length;
+  if (s <= 0 && e >= buffer.length) return buffer;
+  const length = Math.max(1, e - s);
+  const out = new AudioBuffer({ numberOfChannels: buffer.numberOfChannels, length, sampleRate: sr });
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    out.copyToChannel(buffer.getChannelData(ch).subarray(s, s + length), ch);
+  }
+  return out;
 }
 
 /** Decodes an audio file (MP3, WAV, M4A, AAC…) straight to the output format: 48 kHz stereo. */
@@ -606,6 +632,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
   const { width, height } = size;
+  // Trim the whole-video voiceover down to its chosen span once, up front.
+  const wholeVoice = voiceover ? sliceBuffer(voiceover, options.voiceTrim) : undefined;
   let progress = 0;
   let stage = '';
   /** Names the current step in the UI, so a slow or stuck export always shows where it is. */
@@ -690,7 +718,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       const spanEnd = (endClip.start + endClip.frames) / fps;
       // The voiceover can be delayed within its span, but never past the end of the span.
       const start = Math.min(Math.max(spanEnd - 0.1, spanStart), spanStart + Math.max(0, range.startOffset ?? 0));
-      return { buffer: range.buffer, start, end: spanEnd };
+      return { buffer: sliceBuffer(range.buffer, range.trim), start, end: spanEnd };
     })
     .filter((v): v is { buffer: AudioBuffer; start: number; end: number } => v !== null);
 
@@ -764,8 +792,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         scheduleVoice(context, bus, segment.voiceover, segment.voiceStart, segment.end, fade, from, to);
       }
     }
-    if (voiceover) {
-      scheduleVoice(context, bus, voiceover, voiceStart, totalSeconds, VOICE_FADE_OUT, from, to);
+    if (wholeVoice) {
+      scheduleVoice(context, bus, wholeVoice, voiceStart, totalSeconds, VOICE_FADE_OUT, from, to);
     }
     for (const range of rangeVoices) {
       scheduleVoice(context, bus, range.buffer, range.start, range.end, VOICE_FADE_OUT, from, to);
@@ -868,21 +896,26 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       voiceStart,
       fadeOut,
       envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
-      voiceover: clip.voiceover,
+      voiceover: clip.voiceover ? sliceBuffer(clip.voiceover, clip.voiceTrim) : undefined,
     };
     const source = clip.photo ? await stillSource(clip.file) : await videoFileSource(clip.file, planned.frames, segment, clip.trimStart);
     activeSegments.add(segment);
 
     const speedScale = MOTION_SPEED_SCALE[clip.motionSpeed];
-    const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
-    // The pill's own on-screen window (frames), so it can appear partway through and/or leave before the clip ends.
     const playLen = planned.frames / fps;
-    const pillStartSec = clip.pill ? Math.max(0, Math.min(playLen, clip.pill.start)) : 0;
-    const pillEndRaw = clip.pill ? clip.pill.end : 0;
-    const pillEndSec = pillEndRaw > pillStartSec && pillEndRaw < playLen ? pillEndRaw : playLen;
-    const pillStartFrame = Math.round(pillStartSec * fps);
-    const pillEndFrame = Math.max(pillStartFrame + 1, Math.round(pillEndSec * fps));
-    const pillFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor((pillEndFrame - pillStartFrame) / 3)));
+    // Each caption is laid out once and gets its own on-screen window (frames), so captions can appear and
+    // disappear independently and several can show at once.
+    const pills = (clip.pills ?? [])
+      .filter((p) => p.text.trim())
+      .map((p) => {
+        const draw = createPill(ctx, p, width, height);
+        const startSec = Math.max(0, Math.min(playLen, p.start));
+        const endSec = p.end > startSec && p.end < playLen ? p.end : playLen;
+        const startFrame = Math.round(startSec * fps);
+        const endFrame = Math.max(startFrame + 1, Math.round(endSec * fps));
+        const fadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor((endFrame - startFrame) / 3)));
+        return { draw, startFrame, endFrame, fadeFrames };
+      });
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
       clip.images.map(async ({ file, x, y, scale }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), place: { x, y, scale } })),
@@ -916,15 +949,15 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
         drawImages.forEach((draw) => draw(overlayAlpha));
-        // The pill fades in/out at the edges of its own window, which may be shorter than the clip.
-        if (drawPill) {
+        // Each caption fades in/out at the edges of its own window, which may be shorter than the clip.
+        for (const pill of pills) {
           let pillAlpha = 0;
-          if (k >= pillStartFrame && k < pillEndFrame) {
-            const fadeIn = (k - pillStartFrame + 0.5) / pillFadeFrames;
-            const fadeOutP = (pillEndFrame - 1 - k + 0.5) / pillFadeFrames;
+          if (k >= pill.startFrame && k < pill.endFrame) {
+            const fadeIn = (k - pill.startFrame + 0.5) / pill.fadeFrames;
+            const fadeOutP = (pill.endFrame - 1 - k + 0.5) / pill.fadeFrames;
             pillAlpha = alpha * Math.min(1, fadeIn, fadeOutP);
           }
-          drawPill(pillAlpha);
+          pill.draw(pillAlpha);
         }
         ctx.restore();
         k++;

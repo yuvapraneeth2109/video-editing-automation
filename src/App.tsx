@@ -35,8 +35,8 @@ type AudioTrack = { file: File } & (
 );
 
 type PillStyle = { background: string; opacity: number; color: string; font: PillFont; size: number };
-/** `start`/`end` are the pill's on-screen window in seconds from the clip's start (end 0 = until the clip ends). */
-type Pill = { enabled: boolean; text: string; position: PillPosition; start: number; end: number } & PillStyle;
+/** One caption. `start`/`end` are its on-screen window in seconds from the clip's start (end 0 = until the clip ends). */
+type Pill = { id: string; text: string; position: PillPosition; start: number; end: number } & PillStyle;
 
 /** An image overlay: `url` previews it; x/y are its centre (0–1 of the frame) and scale its width (0–1). */
 type Overlay = { id: string; file: File; url: string; x: number; y: number; scale: number } & (
@@ -55,7 +55,10 @@ type Clip = {
   voiceover: AudioTrack | null;
   /** Seconds to delay this clip's (per-clip) voiceover past the start of the clip. */
   voiceOffset: number;
-  pill: Pill;
+  /** Which part of this clip's (per-clip) voiceover audio to use. */
+  voiceTrim: Trim;
+  /** Captions over this clip — any number, each independently placed, sized and timed. */
+  pills: Pill[];
   images: Overlay[];
   motion: Motion;
   motionSpeed: MotionSpeed;
@@ -72,7 +75,7 @@ type Clip = {
 type VoiceMode = 'whole' | 'ranges' | 'per-clip';
 
 /** One voiceover file that covers a run of clips, by their position (inclusive). `startOffset` delays it within the span. */
-type VoiceRange = { id: string; track: AudioTrack; start: number; end: number; startOffset: number };
+type VoiceRange = { id: string; track: AudioTrack; start: number; end: number; startOffset: number; trim: Trim };
 
 type Job =
   | { state: 'idle' }
@@ -106,6 +109,10 @@ const CENTER_BOTTOM: PillPosition = { x: 0.5, y: 0.85 };
 const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system', size: 100 };
 /** Pill text size range, as a percentage of the default. */
 const PILL_SIZE = { min: 40, max: 250, step: 5 };
+/** A fresh caption centred near the bottom, taking the current shared style. */
+const makePill = (style: PillStyle): Pill => ({ id: crypto.randomUUID(), text: '', position: { ...CENTER_BOTTOM }, start: 0, end: 0, ...style });
+/** The CSS font-size (in cqmin) for a pill preview, matching the engine's base×0.042×size maths. */
+const pillPreviewFont = (size: number) => `calc(${(4.2 * Math.min(4, Math.max(0.3, size / 100))).toFixed(2)} * 1cqmin)`;
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
 const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
@@ -169,22 +176,66 @@ function useObjectUrl(file: File | undefined) {
   return url;
 }
 
-/** An inline "listen" player for an audio file (used where AudioPicker isn't). */
-function AudioFilePreview({ file }: { file: File }) {
-  const url = useObjectUrl(file);
-  return url ? <audio className="audio-preview" controls preload="metadata" src={url} /> : null;
-}
-
 type AudioPickerProps = {
   label: string;
   track: AudioTrack | null;
   disabled: boolean;
   onFile: (file: File) => void;
   onRemove: () => void;
+  /** Show the built-in "listen" player. Off for voiceovers, where the VoiceTrimmer provides its own. */
+  preview?: boolean;
 };
 
+/** Trim an audio file to a kept span and preview that span with a "Play selection" button. */
+function VoiceTrimmer({ file, duration, trim, disabled, onChange }: { file: File; duration: number; trim: Trim; disabled: boolean; onChange: (patch: Partial<Trim>) => void }) {
+  const url = useObjectUrl(file);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // An end of 0 (or outside the file) means "to the end" → show the full length.
+  const endEff = trim.end > trim.start && trim.end < duration ? trim.end : duration;
+  const setStart = (v: number) => onChange({ start: clamp(0, Math.max(0, endEff - 0.1), v) });
+  // Dragging "To" to the far end stores 0 = "to the end".
+  const setEnd = (v: number) => onChange({ end: v >= duration ? 0 : clamp(trim.start + 0.1, duration, v) });
+  const playSelection = () => {
+    const a = audioRef.current;
+    if (!a) return;
+    clearTimeout(timer.current);
+    a.currentTime = trim.start;
+    void a.play();
+    // Stop at the end of the selection (one shot, so native controls still play the whole file freely).
+    timer.current = setTimeout(() => a.pause(), Math.max(100, (endEff - trim.start) * 1000) + 80);
+  };
+  return (
+    <div className="voice-trim">
+      <span className="muted">
+        Use {formatTime(trim.start)} to {endEff >= duration ? 'the end' : formatTime(endEff)} ({formatTime(Math.max(0, endEff - trim.start))} of {formatTime(duration)})
+      </span>
+      <div className="trim-bar">
+        <div style={{ left: `${(trim.start / duration) * 100}%`, right: `${100 - (endEff / duration) * 100}%` }} />
+      </div>
+      <label className="offset">
+        <span>From</span>
+        <input type="range" min={0} max={duration} step={0.1} value={trim.start} disabled={disabled} onChange={(e) => setStart(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0} max={duration} step={0.1} value={Number(trim.start.toFixed(1))} disabled={disabled} onChange={(e) => setStart(Number(e.target.value) || 0)} />
+        <span className="meta">s</span>
+      </label>
+      <label className="offset">
+        <span>To</span>
+        <input type="range" min={0} max={duration} step={0.1} value={endEff} disabled={disabled} onChange={(e) => setEnd(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0} max={duration} step={0.1} value={Number(endEff.toFixed(1))} disabled={disabled} onChange={(e) => setEnd(Number(e.target.value) || duration)} />
+        <span className="meta">s</span>
+      </label>
+      <div className="voice-trim-play">
+        <button type="button" className="secondary small" disabled={disabled} onClick={playSelection}>▶ Play selection</button>
+        {url && <audio ref={audioRef} className="audio-preview" controls preload="metadata" src={url} />}
+      </div>
+    </div>
+  );
+}
+
 /** Shows a "+ Add" button, or the chosen file with its duration, a remove button and a listen preview. */
-function AudioPicker({ label, track, disabled, onFile, onRemove }: AudioPickerProps) {
+function AudioPicker({ label, track, disabled, onFile, onRemove, preview = true }: AudioPickerProps) {
   const url = useObjectUrl(track?.status === 'ready' ? track.file : undefined);
   if (!track) {
     return (
@@ -219,7 +270,7 @@ function AudioPicker({ label, track, disabled, onFile, onRemove }: AudioPickerPr
           <button onClick={onRemove} disabled={disabled} aria-label={`Remove ${label}`}>✕</button>
         </span>
       </div>
-      {track.status === 'ready' && url && <audio className="audio-preview" controls preload="metadata" src={url} />}
+      {preview && track.status === 'ready' && url && <audio className="audio-preview" controls preload="metadata" src={url} />}
     </div>
   );
 }
@@ -432,6 +483,71 @@ function PillTiming({ start, end, playLen, disabled, onChange }: { start: number
   );
 }
 
+/** The full editor for ONE caption: text, style, placement (over the frame) and on-screen timing. */
+function PillEditor({
+  pill,
+  index,
+  others,
+  preview,
+  aspect,
+  playLen,
+  disabled,
+  onChange,
+  onRemove,
+  onApplyAll,
+}: {
+  pill: Pill;
+  index: number;
+  others: ReactNode;
+  preview: string | null;
+  aspect: number;
+  playLen: number;
+  disabled: boolean;
+  onChange: (patch: Partial<Pill>) => void;
+  onRemove: () => void;
+  onApplyAll: () => void;
+}) {
+  const has = pill.text.trim().length > 0;
+  return (
+    <div className="pill-item">
+      <div className="pill-head">
+        <input
+          className="text"
+          type="text"
+          placeholder={`Pill ${index + 1} — e.g. Fresh dough, made every morning`}
+          maxLength={PILL_MAX_LENGTH}
+          value={pill.text}
+          disabled={disabled}
+          onChange={(e) => onChange({ text: e.target.value })}
+        />
+        <button className="x" onClick={onRemove} disabled={disabled} aria-label={`Remove pill ${index + 1}`}>✕</button>
+      </div>
+      {has && <PillStyleEditor pill={pill} disabled={disabled} onChange={onChange} onApplyAll={onApplyAll} />}
+      {has && (
+        <PlacementEditor
+          x={pill.position.x}
+          y={pill.position.y}
+          aspect={aspect}
+          background={preview}
+          disabled={disabled}
+          hint="Drag the pill over the frame, or type its X and Y."
+          others={others}
+          onChange={(patch) => onChange({ position: { x: patch.x ?? pill.position.x, y: patch.y ?? pill.position.y } })}
+          renderVisual={(style) => (
+            <span
+              className="place-pill"
+              style={{ ...style, background: toRgba(pill.background, pill.opacity), color: pill.color, fontFamily: PILL_FONTS[pill.font].family, fontSize: pillPreviewFont(pill.size) }}
+            >
+              {pill.text || 'Text'}
+            </span>
+          )}
+        />
+      )}
+      {has && <PillTiming start={pill.start} end={pill.end} playLen={playLen} disabled={disabled} onChange={onChange} />}
+    </div>
+  );
+}
+
 /**
  * Shows a single decoded video frame at `time` (seconds), re-decoding a short moment after `time`
  * stops changing so dragging a trim handle doesn't trigger a decode on every step. Owns its object URL.
@@ -553,6 +669,7 @@ export default function App() {
   const [logoOverlay, setLogoOverlay] = useState<Overlay | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
   const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
+  const [voiceTrim, setVoiceTrim] = useState<Trim>({ start: 0, end: 0 });
   const [voiceStartOffset, setVoiceStartOffset] = useState(0);
   const [ranges, setRanges] = useState<VoiceRange[]>([]);
   const [music, setMusic] = useState<AudioTrack | null>(null);
@@ -609,6 +726,7 @@ export default function App() {
       : voiceMode === 'ranges'
         ? ranges.some((r) => r.track.status === 'ready')
         : voiceover?.status === 'ready';
+  const wholeVoiceTrack = voiceover?.status === 'ready' ? voiceover : null;
   const outputSize = preset === CUSTOM_PRESET ? customSize(custom.width, custom.height) : SIZE_PRESETS[preset];
   const aspect = outputSize.width / outputSize.height;
   const firstPreview = ready[0]?.preview ?? null;
@@ -656,8 +774,9 @@ export default function App() {
       status: 'probing',
       voiceover: null,
       voiceOffset: 0,
+      voiceTrim: { start: 0, end: 0 },
       images: [],
-      pill: { enabled: false, text: '', position: { ...CENTER_BOTTOM }, start: 0, end: 0, ...pillDefaults },
+      pills: [],
       trim: { start: 0, end: 0 },
       ...defaults,
     }));
@@ -691,7 +810,11 @@ export default function App() {
   const update = (id: string, patch: Partial<Clip>) =>
     setClips((prev) => prev.map((c) => (c.id === id ? ({ ...c, ...patch } as Clip) : c)));
 
-  const updatePill = (clip: Clip, patch: Partial<Pill>) => update(clip.id, { pill: { ...clip.pill, ...patch } });
+  const updatePill = (clipId: string, pillId: string, patch: Partial<Pill>) =>
+    setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, pills: c.pills.map((p) => (p.id === pillId ? { ...p, ...patch } : p)) } : c)));
+  const addPill = (clip: Clip) => update(clip.id, { pills: [...clip.pills, makePill(pillDefaults)] });
+  const removePill = (clipId: string, pillId: string) =>
+    setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, pills: c.pills.filter((p) => p.id !== pillId) } : c)));
   const updateTrim = (clip: Clip & { status: 'ready' }, patch: Partial<Trim>) => update(clip.id, { trim: { ...clip.trim, ...patch } });
 
   const updateImage = (clipId: string, imageId: string, patch: Partial<Overlay>) =>
@@ -746,7 +869,7 @@ export default function App() {
   const applyPillStyleToAll = ({ background, opacity, color, font, size }: PillStyle) => {
     const style = { background, opacity, color, font, size };
     setPillDefaults(style);
-    setClips((prev) => prev.map((c) => ({ ...c, pill: { ...c.pill, ...style } })));
+    setClips((prev) => prev.map((c) => ({ ...c, pills: c.pills.map((p) => ({ ...p, ...style })) })));
   };
 
   const setForAll = (patch: Partial<{ transition: Transition; motion: Motion; motionSpeed: MotionSpeed }>) => {
@@ -768,12 +891,14 @@ export default function App() {
     setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
     const loading: AudioTrack = { file, status: 'loading' };
     if (clipId) {
-      update(clipId, { voiceover: loading });
+      update(clipId, { voiceover: loading, voiceOffset: 0, voiceTrim: { start: 0, end: 0 } });
       void decodeAudio(file, (track) =>
         setClips((prev) => prev.map((c) => (c.id === clipId && c.voiceover?.file === file ? { ...c, voiceover: track } : c))),
       );
     } else {
       setVoiceover(loading);
+      setVoiceTrim({ start: 0, end: 0 });
+      setVoiceStartOffset(0);
       void decodeAudio(file, (track) => setVoiceover((current) => (current?.file === file ? track : current)));
     }
   };
@@ -781,10 +906,10 @@ export default function App() {
   const addRangeVoice = (file: File) => {
     setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
     const id = crypto.randomUUID();
-    setRanges((prev) => [...prev, { id, track: { file, status: 'loading' }, start: 0, end: Math.max(0, clips.length - 1), startOffset: 0 }]);
+    setRanges((prev) => [...prev, { id, track: { file, status: 'loading' }, start: 0, end: Math.max(0, clips.length - 1), startOffset: 0, trim: { start: 0, end: 0 } }]);
     void decodeAudio(file, (track) => setRanges((prev) => prev.map((r) => (r.id === id && r.track.file === file ? { ...r, track } : r))));
   };
-  const updateRange = (id: string, patch: Partial<Pick<VoiceRange, 'start' | 'end' | 'startOffset'>>) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const updateRange = (id: string, patch: Partial<Pick<VoiceRange, 'start' | 'end' | 'startOffset' | 'trim'>>) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const removeRange = (id: string) => setRanges((prev) => prev.filter((r) => r.id !== id));
 
   const addMusic = (file: File) => {
@@ -831,20 +956,24 @@ export default function App() {
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
           voiceOffset: perClip ? c.voiceOffset : 0,
+          voiceTrim: perClip ? c.voiceTrim : undefined,
           images: c.images.flatMap((o) => (o.status === 'ready' ? [{ file: o.file, x: o.x, y: o.y, scale: o.scale }] : [])),
-          pill:
-            c.pill.enabled && c.pill.text.trim()
-              ? {
-                  text: c.pill.text,
-                  position: c.pill.position,
-                  background: toRgba(c.pill.background, c.pill.opacity),
-                  color: c.pill.color,
-                  fontFamily: PILL_FONTS[c.pill.font].family,
-                  size: c.pill.size,
-                  start: c.pill.start,
-                  end: c.pill.end,
-                }
-              : undefined,
+          pills: c.pills.flatMap((p) =>
+            p.text.trim()
+              ? [
+                  {
+                    text: p.text,
+                    position: p.position,
+                    background: toRgba(p.background, p.opacity),
+                    color: p.color,
+                    fontFamily: PILL_FONTS[p.font].family,
+                    size: p.size,
+                    start: p.start,
+                    end: p.end,
+                  },
+                ]
+              : [],
+          ),
         })),
         logo,
         size: outputSize,
@@ -857,6 +986,7 @@ export default function App() {
         voiceVolume: voiceVolume / 100,
         musicVolume: musicVolume / 100,
         voiceover: voiceMode === 'whole' ? readyBuffer(voiceover) : undefined,
+        voiceTrim: voiceMode === 'whole' ? voiceTrim : undefined,
         voiceStartOffset,
         voiceRanges:
           voiceMode === 'ranges'
@@ -865,7 +995,7 @@ export default function App() {
                 if (!buffer) return [];
                 const start = Math.max(0, Math.min(lastClip, r.start));
                 const end = Math.max(start, Math.min(lastClip, r.end));
-                return [{ buffer, start, end, startOffset: Math.max(0, r.startOffset) }];
+                return [{ buffer, start, end, startOffset: Math.max(0, r.startOffset), trim: r.trim }];
               })
             : undefined,
         music: readyBuffer(music),
@@ -1000,7 +1130,8 @@ export default function App() {
               </div>
             </li>
             {clips.map((clip, i) => {
-              const voiceSeconds = clip.voiceover?.status === 'ready' ? clip.voiceover.buffer.duration : 0;
+              const clipVoice = clip.voiceover?.status === 'ready' ? clip.voiceover : null;
+              const voiceSeconds = clipVoice ? clipVoice.buffer.duration : 0;
               const playSeconds = clip.status === 'ready' ? clipPlaySeconds(clip) : 0;
               const overflow = perClip && clip.status === 'ready' && voiceSeconds ? voiceSeconds - playSeconds : 0;
               return (
@@ -1077,9 +1208,12 @@ export default function App() {
 
                       {perClip && (
                         <>
-                          <AudioPicker label="Voiceover" track={clip.voiceover} disabled={busy} onFile={(file) => addVoiceover(file, clip.id)} onRemove={() => update(clip.id, { voiceover: null, voiceOffset: 0 })} />
-                          {clip.voiceover?.status === 'ready' && (
-                            <StartOffset value={clip.voiceOffset} max={Math.max(1, playSeconds)} disabled={busy} onChange={(v) => update(clip.id, { voiceOffset: v })} />
+                          <AudioPicker label="Voiceover" track={clip.voiceover} disabled={busy} preview={false} onFile={(file) => addVoiceover(file, clip.id)} onRemove={() => update(clip.id, { voiceover: null, voiceOffset: 0, voiceTrim: { start: 0, end: 0 } })} />
+                          {clipVoice && (
+                            <>
+                              <VoiceTrimmer file={clipVoice.file} duration={clipVoice.buffer.duration} trim={clip.voiceTrim} disabled={busy} onChange={(patch) => update(clip.id, { voiceTrim: { ...clip.voiceTrim, ...patch } })} />
+                              <StartOffset value={clip.voiceOffset} max={Math.max(1, playSeconds)} disabled={busy} onChange={(v) => update(clip.id, { voiceOffset: v })} />
+                            </>
                           )}
                           {overflow > 0.5 && (
                             <p className="hint warn">
@@ -1097,64 +1231,45 @@ export default function App() {
                         </>
                       )}
 
-                      <label className="toggle">
-                        <input type="checkbox" checked={clip.pill.enabled} disabled={busy} onChange={(e) => updatePill(clip, { enabled: e.target.checked })} />
-                        Add a text pill that explains this clip
-                      </label>
-
-                      {clip.pill.enabled && (
-                        <input
-                          className="text"
-                          type="text"
-                          placeholder="e.g. Fresh dough, made every morning"
-                          maxLength={PILL_MAX_LENGTH}
-                          value={clip.pill.text}
-                          disabled={busy}
-                          autoFocus
-                          onChange={(e) => updatePill(clip, { text: e.target.value })}
-                        />
-                      )}
-
-                      {clip.pill.enabled && clip.pill.text.trim() && (
-                        <PillStyleEditor pill={clip.pill} disabled={busy} onChange={(patch) => updatePill(clip, patch)} onApplyAll={() => applyPillStyleToAll(clip.pill)} />
-                      )}
-
-                      {clip.pill.enabled && clip.pill.text.trim() && (
-                        <PlacementEditor
-                          x={clip.pill.position.x}
-                          y={clip.pill.position.y}
-                          aspect={aspect}
-                          background={clip.preview}
-                          disabled={busy}
-                          hint="Drag the pill over the frame, or type its X and Y."
-                          onChange={(patch) => updatePill(clip, { position: { x: patch.x ?? clip.pill.position.x, y: patch.y ?? clip.pill.position.y } })}
-                          renderVisual={(style) => (
-                            <span
-                              className="place-pill"
-                              style={{
-                                ...style,
-                                background: toRgba(clip.pill.background, clip.pill.opacity),
-                                color: clip.pill.color,
-                                fontFamily: PILL_FONTS[clip.pill.font].family,
-                                // Matches the engine: font = 4.2% of the frame's shorter side × the size %.
-                                fontSize: `calc(${(4.2 * Math.min(4, Math.max(0.3, clip.pill.size / 100))).toFixed(2)} * 1cqmin)`,
-                              }}
-                            >
-                              {clip.pill.text || 'Text'}
-                            </span>
-                          )}
-                        />
-                      )}
-
-                      {clip.pill.enabled && clip.pill.text.trim() && (
-                        <PillTiming
-                          start={clip.pill.start}
-                          end={clip.pill.end}
-                          playLen={playSeconds}
-                          disabled={busy}
-                          onChange={(patch) => updatePill(clip, patch)}
-                        />
-                      )}
+                      <div className="pills">
+                        <span className="muted">Text pills (captions) — add as many as you like</span>
+                        {clip.pills.map((pill, pidx) => (
+                          <PillEditor
+                            key={pill.id}
+                            pill={pill}
+                            index={pidx}
+                            preview={clip.preview}
+                            aspect={aspect}
+                            playLen={playSeconds}
+                            disabled={busy}
+                            others={clip.pills
+                              .filter((o) => o.id !== pill.id && o.text.trim())
+                              .map((o) => (
+                                <span
+                                  key={o.id}
+                                  className="place-pill other"
+                                  style={{
+                                    left: `${o.position.x * 100}%`,
+                                    top: `${o.position.y * 100}%`,
+                                    transform: 'translate(-50%, -50%)',
+                                    background: toRgba(o.background, o.opacity),
+                                    color: o.color,
+                                    fontFamily: PILL_FONTS[o.font].family,
+                                    fontSize: pillPreviewFont(o.size),
+                                  }}
+                                >
+                                  {o.text}
+                                </span>
+                              ))}
+                            onChange={(patch) => updatePill(clip.id, pill.id, patch)}
+                            onRemove={() => removePill(clip.id, pill.id)}
+                            onApplyAll={() => applyPillStyleToAll(pill)}
+                          />
+                        ))}
+                        <button type="button" className="slot-pick" disabled={busy} onClick={() => addPill(clip)}>
+                          + Add {clip.pills.length ? 'another ' : ''}text pill
+                        </button>
+                      </div>
 
                       <div className="images">
                         <span className="muted">Images over this clip</span>
@@ -1301,8 +1416,13 @@ export default function App() {
 
               {voiceMode === 'whole' && (
                 <>
-                  <AudioPicker label="Voiceover" track={voiceover} disabled={busy} onFile={(file) => addVoiceover(file)} onRemove={() => setVoiceover(null)} />
-                  {voiceover?.status === 'ready' && <StartOffset value={voiceStartOffset} max={Math.max(1, totalSeconds - logoSeconds)} disabled={busy} onChange={setVoiceStartOffset} />}
+                  <AudioPicker label="Voiceover" track={voiceover} disabled={busy} preview={false} onFile={(file) => addVoiceover(file)} onRemove={() => setVoiceover(null)} />
+                  {wholeVoiceTrack && (
+                    <>
+                      <VoiceTrimmer file={wholeVoiceTrack.file} duration={wholeVoiceTrack.buffer.duration} trim={voiceTrim} disabled={busy} onChange={(patch) => setVoiceTrim((t) => ({ ...t, ...patch }))} />
+                      <StartOffset value={voiceStartOffset} max={Math.max(1, totalSeconds - logoSeconds)} disabled={busy} onChange={setVoiceStartOffset} />
+                    </>
+                  )}
                   {voiceOverflow > 0.5 && <p className="hint warn">The voiceover is {formatTime(voiceOverflow)} longer than the remaining video and will be cut at the end.</p>}
                 </>
               )}
@@ -1330,7 +1450,7 @@ export default function App() {
                             <button onClick={() => removeRange(r.id)} disabled={busy} aria-label="Remove voiceover">✕</button>
                           </span>
                         </div>
-                        {r.track.status === 'ready' && <AudioFilePreview file={r.track.file} />}
+                        {buffer && <VoiceTrimmer file={r.track.file} duration={buffer.duration} trim={r.trim} disabled={busy} onChange={(patch) => updateRange(r.id, { trim: { ...r.trim, ...patch } })} />}
                         <div className="range-span">
                           <span>Plays over</span>
                           <select value={start} disabled={busy} onChange={(e) => updateRange(r.id, { start: Number(e.target.value), end: Math.max(Number(e.target.value), end) })}>
