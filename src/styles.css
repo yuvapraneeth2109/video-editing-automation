@@ -188,9 +188,20 @@ button.link:disabled { opacity: 0.5; }
 .offset input[type='range'] { width: 100%; accent-color: var(--blue); }
 .audio-slot { display: grid; gap: 8px; }
 .audio-preview { width: 100%; height: 34px; }
-.trim { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; }
+.trim { display: grid; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; }
 .trim-bar { position: relative; height: 8px; border-radius: 999px; background: var(--border); overflow: hidden; }
 .trim-bar > div { position: absolute; top: 0; bottom: 0; background: var(--gradient); }
+/* Filmstrip: frames across the whole clip, with the trimmed-out ends dimmed and the cut points marked. */
+.filmstrip { position: relative; display: flex; height: 64px; border-radius: 8px; overflow: hidden; background: #000; border: 1px solid var(--border); }
+.filmstrip img { flex: 1 1 0; width: 0; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+.filmstrip-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); }
+.trim-dim { position: absolute; top: 0; bottom: 0; background: rgba(0, 0, 0, 0.62); pointer-events: none; }
+.trim-edge { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--blue); box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); pointer-events: none; }
+/* The exact frames at the current start and end of the kept range. */
+.frame-previews { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.frame-preview { margin: 0; display: grid; gap: 4px; }
+.frame-preview img, .frame-ph { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #000; border-radius: 8px; border: 1px solid var(--border); display: block; }
+.frame-preview figcaption { font-size: 12px; color: var(--muted); }
 .photo-meta { display: inline-flex; align-items: center; gap: 6px; }
 input.text.seconds { width: 64px; padding: 4px 6px; font-size: 13px; }
 .custom-size { display: flex; align-items: center; gap: 8px; color: var(--text); }

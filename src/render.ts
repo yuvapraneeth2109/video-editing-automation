@@ -25,7 +25,9 @@ import {
 } from 'mediabunny';
 
 import {
+  H264_MAX_BYTES,
   MOTION_SPEED_SCALE,
+  h264FitSize,
   planTimeline,
   type ClipInfo,
   type Motion,
@@ -48,18 +50,6 @@ const VOICE_FADE_OUT = 0.4;
 const CLIP_VOICE_FADE_OUT = 0.3;
 /** Text pills and images fade in and out over this many seconds. */
 const OVERLAY_FADE = 0.4;
-
-/** The optional "Download as H.264" button keeps the file under this many bytes. */
-const H264_MAX_BYTES = 5 * 1024 * 1024;
-/** Audio is copied (not re-encoded) into the H.264 file; reserved from the budget as a safe upper bound. */
-const H264_AUDIO_RESERVE = 256_000;
-/** Floor for the H.264 video bitrate when fitting the budget. */
-const H264_MIN_VIDEO_BITRATE = 300_000;
-/**
- * Target H.264 bits per pixel per frame for a clean, block-free picture. When a video is too big for 5 MB,
- * the resolution is lowered until its bitrate meets this — so the result stays smooth, never pixelated.
- */
-const H264_TARGET_BPP = 0.11;
 
 const toEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
@@ -226,6 +216,39 @@ export async function makeThumbnail(file: File, photo: boolean): Promise<string>
     ctx.fillRect(0, 0, tw, th);
     ctx.drawImage(first.value.canvas, 0, 0);
     return URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 }));
+  } finally {
+    input.dispose();
+  }
+}
+
+/**
+ * Decodes still frames from a video at the given times (seconds from the clip's own start) and returns a
+ * JPEG object URL for each, so the trim UI can show the user exactly where they are cutting. Callers own
+ * the URLs and must revokeObjectURL them. `times` should be in ascending order for the fastest decode;
+ * a time with no decodable frame (e.g. right at the very end) comes back as a black frame, never missing,
+ * so the returned array always has one URL per requested time.
+ */
+export async function makeFrames(file: File, times: number[], maxEdge = 200): Promise<string[]> {
+  const input = openInput(file);
+  try {
+    const track = await input.getPrimaryVideoTrack();
+    if (!track || !(await track.canDecode())) throw new Error('No frames available.');
+    const [w, h, origin] = await Promise.all([track.getDisplayWidth(), track.getDisplayHeight(), input.getFirstTimestamp()]);
+    const scale = Math.min(1, maxEdge / Math.max(w, h));
+    const tw = toEven(w * scale);
+    const th = toEven(h * scale);
+    const sink = new CanvasSink(track, { width: tw, height: th, fit: 'contain', poolSize: 2 });
+    const stamps = times.map((t) => origin + Math.max(0, t));
+    const urls: string[] = [];
+    for await (const wrapped of sink.canvasesAtTimestamps(stamps)) {
+      const canvas = new OffscreenCanvas(tw, th);
+      const g = canvas.getContext('2d', { alpha: false })!;
+      g.fillStyle = '#000000';
+      g.fillRect(0, 0, tw, th);
+      if (wrapped) g.drawImage(wrapped.canvas, 0, 0);
+      urls.push(URL.createObjectURL(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 })));
+    }
+    return urls;
   } finally {
     input.dispose();
   }
@@ -986,20 +1009,13 @@ export async function transcodeH264(
         input.computeDuration(),
         track.computeFrameRateMetrics(),
       ]);
-      const dur = Math.max(0.1, duration);
-      const fps = metrics.bestGuessFrameRate > 0 ? metrics.bestGuessFrameRate : 30;
-      // 0.88 leaves headroom for container overhead and variable-bitrate overshoot, so the file lands under the limit.
-      const videoBitrate = Math.max(H264_MIN_VIDEO_BITRATE, Math.floor((maxBytes * 8 * 0.88 - H264_AUDIO_RESERVE * dur) / dur));
-      // The most pixels this bitrate can carry cleanly (no blocking); scale the picture down to it if needed.
-      const cleanPixels = videoBitrate / (fps * H264_TARGET_BPP);
-      const scale = Math.min(1, Math.sqrt(cleanPixels / (w * h)));
-      const outW = toEven(w * scale);
-      const outH = toEven(h * scale);
+      // Same formula the UI uses to show the resolution before preparing, so the two always match.
+      const fit = h264FitSize(w, h, metrics.bestGuessFrameRate, duration, maxBytes);
       video = {
         codec: 'avc',
-        bitrate: videoBitrate,
+        bitrate: fit.bitrate,
         keyFrameInterval: 2,
-        ...(scale < 1 ? { width: outW, height: outH, fit: 'contain' as const } : {}),
+        ...(fit.downscaled ? { width: fit.width, height: fit.height, fit: 'contain' as const } : {}),
         ...(IS_WEBKIT ? { hardwareAcceleration: 'prefer-software' as const } : {}),
       };
     }

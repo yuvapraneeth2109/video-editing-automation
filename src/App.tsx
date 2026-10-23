@@ -10,9 +10,11 @@ import {
   type Motion,
   type MotionSpeed,
   CUSTOM_SIZE_LIMITS,
+  H264_MAX_BYTES,
   PILL_FONTS,
   QUALITY_LABELS,
   customSize,
+  h264FitSize,
   type PillFont,
   type PillPosition,
   type Quality,
@@ -72,7 +74,18 @@ type VoiceRange = { id: string; track: AudioTrack; start: number; end: number };
 type Job =
   | { state: 'idle' }
   | { state: 'rendering'; progress: number; stage: string; startedAt: number; updatedAt: number }
-  | { state: 'done'; url: string; blob: Blob; size: number; seconds: number };
+  | {
+      state: 'done';
+      url: string;
+      blob: Blob;
+      size: number;
+      seconds: number;
+      /** The exported video's own size, length and frame rate — used to predict the H.264 download. */
+      outWidth: number;
+      outHeight: number;
+      durationSeconds: number;
+      videoFps: number;
+    };
 
 type DoneOrError = Job | { state: 'error'; message: string };
 
@@ -372,19 +385,105 @@ const overlayBox = (o: Overlay, frameAspect: number): CSSProperties => {
   };
 };
 
-/** Trim a video to a kept start..end range, with sliders and exact seconds. */
+/**
+ * Shows a single decoded video frame at `time` (seconds), re-decoding a short moment after `time`
+ * stops changing so dragging a trim handle doesn't trigger a decode on every step. Owns its object URL.
+ */
+function FramePreview({ file, time, label }: { file: File; time: number; label: string }) {
+  const [url, setUrl] = useState<string>();
+  const current = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    current.current = url;
+  }, [url]);
+  // Final clean-up on unmount: release whichever URL is showing.
+  useEffect(() => () => void (current.current && URL.revokeObjectURL(current.current)), []);
+  useEffect(() => {
+    let active = true;
+    const handle = setTimeout(() => {
+      void loadEngine()
+        .then(({ makeFrames }) => makeFrames(file, [time], 260))
+        .then(
+          ([next]) => {
+            if (!active) {
+              if (next) URL.revokeObjectURL(next);
+              return;
+            }
+            setUrl((prev) => {
+              if (prev) URL.revokeObjectURL(prev);
+              return next;
+            });
+          },
+          () => {},
+        );
+    }, 200);
+    return () => {
+      active = false;
+      clearTimeout(handle);
+    };
+  }, [file, time]);
+  return (
+    <figure className="frame-preview">
+      {url ? <img src={url} alt="" draggable={false} /> : <span className="frame-ph" />}
+      <figcaption>
+        {label} · {formatTime(time)}
+      </figcaption>
+    </figure>
+  );
+}
+
+/** Trim a video to a kept start..end range: a filmstrip to see where to cut, live start/end frames, sliders and exact seconds. */
 function TrimControl({ clip, disabled, onChange }: { clip: Clip & { status: 'ready' }; disabled: boolean; onChange: (patch: Partial<Trim>) => void }) {
   const dur = clip.info.duration;
   const { start, end } = clip.trim;
   const setStart = (v: number) => onChange({ start: clamp(0, end - 0.2, v) });
   const setEnd = (v: number) => onChange({ end: clamp(start + 0.2, dur, v) });
+
+  // A strip of frames across the whole clip, decoded once, so the user can see the content while trimming.
+  const [strip, setStrip] = useState<string[]>([]);
+  useEffect(() => {
+    let active = true;
+    let made: string[] = [];
+    const count = 8;
+    const times = Array.from({ length: count }, (_, i) => ((i + 0.5) / count) * dur);
+    void loadEngine()
+      .then(({ makeFrames }) => makeFrames(clip.file, times, 170))
+      .then(
+        (urls) => {
+          if (!active) {
+            urls.forEach(URL.revokeObjectURL);
+            return;
+          }
+          made = urls;
+          setStrip(urls);
+        },
+        () => {},
+      );
+    return () => {
+      active = false;
+      made.forEach(URL.revokeObjectURL);
+    };
+  }, [clip.file, dur]);
+
+  const pct = (t: number) => `${(t / dur) * 100}%`;
   return (
     <div className="trim">
       <span className="muted">
         Trim — keep {formatTime(start)} to {formatTime(end)} ({formatTime(Math.max(0, end - start))} of {formatTime(dur)})
       </span>
-      <div className="trim-bar">
-        <div style={{ left: `${(start / dur) * 100}%`, right: `${100 - (end / dur) * 100}%` }} />
+      <div className="filmstrip" aria-hidden="true">
+        {strip.length ? (
+          strip.map((u, i) => <img key={i} src={u} alt="" draggable={false} />)
+        ) : (
+          <span className="filmstrip-loading">Loading frames…</span>
+        )}
+        <span className="trim-dim" style={{ left: 0, width: pct(start) }} />
+        <span className="trim-dim" style={{ right: 0, width: `${100 - (end / dur) * 100}%` }} />
+        <span className="trim-edge" style={{ left: pct(start) }} />
+        <span className="trim-edge" style={{ left: pct(end) }} />
+      </div>
+      <div className="frame-previews">
+        <FramePreview file={clip.file} time={start} label="Start frame" />
+        <FramePreview file={clip.file} time={Math.max(start, end - 0.05)} label="End frame" />
       </div>
       <label className="offset">
         <span>Start</span>
@@ -466,6 +565,15 @@ export default function App() {
   const outputSize = preset === CUSTOM_PRESET ? customSize(custom.width, custom.height) : SIZE_PRESETS[preset];
   const aspect = outputSize.width / outputSize.height;
   const firstPreview = ready[0]?.preview ?? null;
+
+  // The resolution the H.264 ≤5 MB download will produce, shown up front so it is never a surprise:
+  // a video that already fits keeps its full size; a longer one is scaled down to stay smooth under 5 MB.
+  const h264Fit =
+    job.state === 'done'
+      ? job.size <= H264_MAX_BYTES
+        ? { width: job.outWidth, height: job.outHeight, downscaled: false }
+        : h264FitSize(job.outWidth, job.outHeight, job.videoFps, job.durationSeconds)
+      : null;
 
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion' | 'motionSpeed'>(key: K) =>
@@ -721,7 +829,17 @@ export default function App() {
       });
       logo.close();
       setH264({ status: 'idle' });
-      setJob({ state: 'done', url: URL.createObjectURL(result), blob: result, size: result.size, seconds: (performance.now() - startedAt) / 1000 });
+      setJob({
+        state: 'done',
+        url: URL.createObjectURL(result),
+        blob: result,
+        size: result.size,
+        seconds: (performance.now() - startedAt) / 1000,
+        outWidth: outputSize.width,
+        outHeight: outputSize.height,
+        durationSeconds: totalSeconds,
+        videoFps: fps,
+      });
     } catch (e) {
       console.error('Export failed', e);
       if (controller.signal.aborted) setJob({ state: 'idle' });
@@ -1326,22 +1444,33 @@ export default function App() {
           <video className="preview" src={job.url} controls playsInline />
           <div className="row">
             <a className="button primary" href={job.url} download={downloadName()}>
-              Download (best quality)
+              Download (best quality) · {job.outWidth}×{job.outHeight}
             </a>
             {h264.status === 'ready' ? (
               <a className="button secondary" href={h264.url} download={downloadName('-h264')}>
-                Download H.264 ({formatBytes(h264.size)})
+                Download H.264 ({formatBytes(h264.size)}{h264Fit ? ` · ${h264Fit.width}×${h264Fit.height}` : ''})
               </a>
             ) : h264.status === 'working' ? (
               <span className="button secondary" aria-busy="true">Preparing H.264… {Math.round(h264.progress * 100)}%</span>
             ) : (
-              <button className="secondary" onClick={prepareH264}>Prepare H.264 (max 5 MB)</button>
+              <button className="secondary" onClick={prepareH264}>
+                Prepare H.264 (max 5 MB{h264Fit ? ` · ${h264Fit.width}×${h264Fit.height}` : ''})
+              </button>
             )}
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            “Download (best quality)” gives the file exactly as made. “Prepare H.264” makes an H.264 MP4 under 5 MB: if your video already fits it is copied at identical quality; if it is larger, the resolution is lowered just enough to keep it smooth — never pixelated.
-            {h264.status === 'ready' ? ' Your file is ready — click “Download H.264”.' : ''}
+            <strong>“Download (best quality)” is your {job.outWidth}×{job.outHeight} file</strong> — exactly as made, at the size you chose.
+            {h264Fit?.downscaled ? (
+              <>
+                {' '}“Prepare H.264” makes a copy under 5 MB. This video is {formatTime(job.durationSeconds)} long, so at {job.outWidth}×{job.outHeight} it can't fit 5 MB without becoming blocky — so that copy is {h264Fit.width}×{h264Fit.height} instead, to stay smooth. Trim your clips shorter and the H.264 copy keeps more of the {job.outWidth}×{job.outHeight} size.
+              </>
+            ) : (
+              <>
+                {' '}“Prepare H.264” makes a copy under 5 MB; this video fits, so it's copied at the full {job.outWidth}×{job.outHeight} with identical quality.
+              </>
+            )}
+            {h264.status === 'ready' ? ' Your H.264 file is ready — click “Download H.264”.' : ''}
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>
