@@ -110,32 +110,28 @@ export function customSize(width: number, height: number): Size {
 export const H264_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
- * Works out the resolution (and video bitrate) the H.264 ≤ `maxBytes` download will use for a video of
- * this size, frame rate and length. A short enough video keeps its full resolution; a long one is scaled
- * down just enough that the bitrate the budget allows stays block-free (`downscaled` is then true).
+ * Works out the video bitrate the H.264 ≤ `maxBytes` download will use for a video of this size and length.
+ * The resolution is ALWAYS the size the user chose — the budget is met by bitrate alone, never by shrinking
+ * the picture — so the download matches the selected size (e.g. 1024×1024). A long video therefore gets a
+ * lower bitrate and may look softer, which trimming shorter or a smaller output size improves.
  * Shared by the UI (to show the size before preparing) and the engine (to produce it), so they always agree.
  */
 export function h264FitSize(
   width: number,
   height: number,
-  fps: number,
+  _fps: number,
   seconds: number,
   maxBytes = H264_MAX_BYTES,
 ): { width: number; height: number; bitrate: number; downscaled: boolean } {
   /** Audio is copied (not re-encoded); reserved from the budget as a safe upper bound. */
   const AUDIO_RESERVE = 256_000;
-  /** Floor for the video bitrate when fitting the budget. */
+  /** Floor for the video bitrate, so extremely long videos still get a usable picture (file may then exceed the budget). */
   const MIN_BITRATE = 300_000;
-  /** Target bits per pixel per frame for a clean, block-free H.264 picture. */
-  const TARGET_BPP = 0.11;
   const dur = Math.max(0.1, seconds);
-  const rate = fps > 0 ? fps : 30;
   // 0.88 leaves headroom for container overhead and variable-bitrate overshoot, so the file lands under the limit.
   const bitrate = Math.max(MIN_BITRATE, Math.floor((maxBytes * 8 * 0.88 - AUDIO_RESERVE * dur) / dur));
-  // The most pixels this bitrate can carry cleanly; scale the picture down to it if needed.
-  const cleanPixels = bitrate / (rate * TARGET_BPP);
-  const scale = Math.min(1, Math.sqrt(cleanPixels / (width * height)));
-  return { width: even(width * scale), height: even(height * scale), bitrate, downscaled: scale < 1 };
+  // Keep the exact size the user chose; the budget is met by bitrate, not by downscaling.
+  return { width: even(width), height: even(height), bitrate, downscaled: false };
 }
 
 /** Encoding quality: higher means a sharper picture and a bigger file. */

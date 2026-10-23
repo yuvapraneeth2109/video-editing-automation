@@ -159,6 +159,8 @@ button.link:disabled { opacity: 0.5; }
   touch-action: none;
   user-select: none;
   cursor: grab;
+  /* So the preview pill's font-size can be set in cqmin units that match the export maths. */
+  container-type: size;
 }
 .placer:active { cursor: grabbing; }
 .place-img { position: absolute; object-fit: contain; pointer-events: none; }
@@ -166,14 +168,14 @@ button.link:disabled { opacity: 0.5; }
 .place-pill {
   position: absolute;
   max-width: 80%;
-  padding: 4px 10px;
+  padding: 0.35em 0.75em;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.3;
   text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
   pointer-events: none;
 }
 
@@ -188,6 +190,7 @@ button.link:disabled { opacity: 0.5; }
 .offset input[type='range'] { width: 100%; accent-color: var(--blue); }
 .audio-slot { display: grid; gap: 8px; }
 .audio-preview { width: 100%; height: 34px; }
+.pill-timing { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; }
 .trim { display: grid; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; }
 .trim-bar { position: relative; height: 8px; border-radius: 999px; background: var(--border); overflow: hidden; }
 .trim-bar > div { position: absolute; top: 0; bottom: 0; background: var(--gradient); }

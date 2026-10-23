@@ -34,8 +34,9 @@ type AudioTrack = { file: File } & (
   | { status: 'error'; error: string }
 );
 
-type PillStyle = { background: string; opacity: number; color: string; font: PillFont };
-type Pill = { enabled: boolean; text: string; position: PillPosition } & PillStyle;
+type PillStyle = { background: string; opacity: number; color: string; font: PillFont; size: number };
+/** `start`/`end` are the pill's on-screen window in seconds from the clip's start (end 0 = until the clip ends). */
+type Pill = { enabled: boolean; text: string; position: PillPosition; start: number; end: number } & PillStyle;
 
 /** An image overlay: `url` previews it; x/y are its centre (0–1 of the frame) and scale its width (0–1). */
 type Overlay = { id: string; file: File; url: string; x: number; y: number; scale: number } & (
@@ -52,6 +53,8 @@ type Clip = {
   /** A small still preview (object URL), filled in after the file is read. */
   preview: string | null;
   voiceover: AudioTrack | null;
+  /** Seconds to delay this clip's (per-clip) voiceover past the start of the clip. */
+  voiceOffset: number;
   pill: Pill;
   images: Overlay[];
   motion: Motion;
@@ -68,8 +71,8 @@ type Clip = {
 
 type VoiceMode = 'whole' | 'ranges' | 'per-clip';
 
-/** One voiceover file that covers a run of clips, by their position (inclusive). */
-type VoiceRange = { id: string; track: AudioTrack; start: number; end: number };
+/** One voiceover file that covers a run of clips, by their position (inclusive). `startOffset` delays it within the span. */
+type VoiceRange = { id: string; track: AudioTrack; start: number; end: number; startOffset: number };
 
 type Job =
   | { state: 'idle' }
@@ -100,7 +103,9 @@ const SIZE_OPTIONS = [...Object.keys(SIZE_PRESETS), CUSTOM_PRESET];
 /** The pill starts centred near the bottom. x/y are its CENTRE as a fraction of the frame. */
 const CENTER_BOTTOM: PillPosition = { x: 0.5, y: 0.85 };
 
-const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system' };
+const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, color: '#ffffff', font: 'system', size: 100 };
+/** Pill text size range, as a percentage of the default. */
+const PILL_SIZE = { min: 40, max: 250, step: 5 };
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
 const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
@@ -162,6 +167,12 @@ function useObjectUrl(file: File | undefined) {
     return () => URL.revokeObjectURL(u);
   }, [file]);
   return url;
+}
+
+/** An inline "listen" player for an audio file (used where AudioPicker isn't). */
+function AudioFilePreview({ file }: { file: File }) {
+  const url = useObjectUrl(file);
+  return url ? <audio className="audio-preview" controls preload="metadata" src={url} /> : null;
 }
 
 type AudioPickerProps = {
@@ -286,6 +297,13 @@ function PillStyleEditor({ pill, disabled, onChange, onApplyAll }: { pill: Pill;
             ))}
           </select>
         </label>
+        <label>
+          Text size
+          <span className="color-row">
+            <input type="range" min={PILL_SIZE.min} max={PILL_SIZE.max} step={PILL_SIZE.step} value={pill.size} disabled={disabled} onChange={(e) => onChange({ size: Number(e.target.value) })} />
+            <span className="meta">{pill.size}%</span>
+          </span>
+        </label>
       </div>
       <button className="link" disabled={disabled} onClick={onApplyAll}>
         Use this style for all pills
@@ -384,6 +402,35 @@ const overlayBox = (o: Overlay, frameAspect: number): CSSProperties => {
     transform: 'translate(-50%, -50%)',
   };
 };
+
+/** Chooses when the pill appears and disappears within the clip. A "Hides at" of the full length means "until the clip ends". */
+function PillTiming({ start, end, playLen, disabled, onChange }: { start: number; end: number; playLen: number; disabled: boolean; onChange: (patch: { start?: number; end?: number }) => void }) {
+  // A stored end of 0 (or one outside the window) means "stay until the clip ends" → show the full length.
+  const shownEnd = end > start && end < playLen ? end : playLen;
+  const max = Math.max(0.2, playLen);
+  const setStart = (v: number) => onChange({ start: clamp(0, Math.max(0, playLen - 0.2), v) });
+  // Dragging to the far end stores 0 = "until the clip ends"; anything less is a real hide time.
+  const setEnd = (v: number) => onChange({ end: v >= playLen ? 0 : clamp(start + 0.2, playLen, v) });
+  return (
+    <div className="pill-timing">
+      <span className="muted">
+        Pill timing — shows from {formatTime(start)} to {shownEnd >= playLen ? 'the end' : formatTime(shownEnd)} of this clip
+      </span>
+      <label className="offset">
+        <span>Appears at</span>
+        <input type="range" min={0} max={max} step={0.1} value={start} disabled={disabled} onChange={(e) => setStart(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0} max={playLen} step={0.1} value={Number(start.toFixed(1))} disabled={disabled} onChange={(e) => setStart(Number(e.target.value) || 0)} />
+        <span className="meta">s</span>
+      </label>
+      <label className="offset">
+        <span>Hides at</span>
+        <input type="range" min={0} max={max} step={0.1} value={shownEnd} disabled={disabled} onChange={(e) => setEnd(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0} max={playLen} step={0.1} value={Number(shownEnd.toFixed(1))} disabled={disabled} onChange={(e) => setEnd(Number(e.target.value) || playLen)} />
+        <span className="meta">s</span>
+      </label>
+    </div>
+  );
+}
 
 /**
  * Shows a single decoded video frame at `time` (seconds), re-decoding a short moment after `time`
@@ -608,8 +655,9 @@ export default function App() {
       preview: null,
       status: 'probing',
       voiceover: null,
+      voiceOffset: 0,
       images: [],
-      pill: { enabled: false, text: '', position: { ...CENTER_BOTTOM }, ...pillDefaults },
+      pill: { enabled: false, text: '', position: { ...CENTER_BOTTOM }, start: 0, end: 0, ...pillDefaults },
       trim: { start: 0, end: 0 },
       ...defaults,
     }));
@@ -695,8 +743,8 @@ export default function App() {
     setLogoOverlay(null);
   };
 
-  const applyPillStyleToAll = ({ background, opacity, color, font }: PillStyle) => {
-    const style = { background, opacity, color, font };
+  const applyPillStyleToAll = ({ background, opacity, color, font, size }: PillStyle) => {
+    const style = { background, opacity, color, font, size };
     setPillDefaults(style);
     setClips((prev) => prev.map((c) => ({ ...c, pill: { ...c.pill, ...style } })));
   };
@@ -733,10 +781,10 @@ export default function App() {
   const addRangeVoice = (file: File) => {
     setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
     const id = crypto.randomUUID();
-    setRanges((prev) => [...prev, { id, track: { file, status: 'loading' }, start: 0, end: Math.max(0, clips.length - 1) }]);
+    setRanges((prev) => [...prev, { id, track: { file, status: 'loading' }, start: 0, end: Math.max(0, clips.length - 1), startOffset: 0 }]);
     void decodeAudio(file, (track) => setRanges((prev) => prev.map((r) => (r.id === id && r.track.file === file ? { ...r, track } : r))));
   };
-  const updateRange = (id: string, patch: Partial<Pick<VoiceRange, 'start' | 'end'>>) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const updateRange = (id: string, patch: Partial<Pick<VoiceRange, 'start' | 'end' | 'startOffset'>>) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const removeRange = (id: string) => setRanges((prev) => prev.filter((r) => r.id !== id));
 
   const addMusic = (file: File) => {
@@ -782,6 +830,7 @@ export default function App() {
           trimStart: c.photo ? 0 : c.trim.start,
           transition: c.transition,
           voiceover: perClip ? readyBuffer(c.voiceover) : undefined,
+          voiceOffset: perClip ? c.voiceOffset : 0,
           images: c.images.flatMap((o) => (o.status === 'ready' ? [{ file: o.file, x: o.x, y: o.y, scale: o.scale }] : [])),
           pill:
             c.pill.enabled && c.pill.text.trim()
@@ -791,6 +840,9 @@ export default function App() {
                   background: toRgba(c.pill.background, c.pill.opacity),
                   color: c.pill.color,
                   fontFamily: PILL_FONTS[c.pill.font].family,
+                  size: c.pill.size,
+                  start: c.pill.start,
+                  end: c.pill.end,
                 }
               : undefined,
         })),
@@ -813,7 +865,7 @@ export default function App() {
                 if (!buffer) return [];
                 const start = Math.max(0, Math.min(lastClip, r.start));
                 const end = Math.max(start, Math.min(lastClip, r.end));
-                return [{ buffer, start, end }];
+                return [{ buffer, start, end, startOffset: Math.max(0, r.startOffset) }];
               })
             : undefined,
         music: readyBuffer(music),
@@ -1025,7 +1077,10 @@ export default function App() {
 
                       {perClip && (
                         <>
-                          <AudioPicker label="Voiceover" track={clip.voiceover} disabled={busy} onFile={(file) => addVoiceover(file, clip.id)} onRemove={() => update(clip.id, { voiceover: null })} />
+                          <AudioPicker label="Voiceover" track={clip.voiceover} disabled={busy} onFile={(file) => addVoiceover(file, clip.id)} onRemove={() => update(clip.id, { voiceover: null, voiceOffset: 0 })} />
+                          {clip.voiceover?.status === 'ready' && (
+                            <StartOffset value={clip.voiceOffset} max={Math.max(1, playSeconds)} disabled={busy} onChange={(v) => update(clip.id, { voiceOffset: v })} />
+                          )}
                           {overflow > 0.5 && (
                             <p className="hint warn">
                               This voiceover is {formatTime(overflow)} longer than the clip and will be cut at the end.
@@ -1076,11 +1131,28 @@ export default function App() {
                           renderVisual={(style) => (
                             <span
                               className="place-pill"
-                              style={{ ...style, background: toRgba(clip.pill.background, clip.pill.opacity), color: clip.pill.color, fontFamily: PILL_FONTS[clip.pill.font].family }}
+                              style={{
+                                ...style,
+                                background: toRgba(clip.pill.background, clip.pill.opacity),
+                                color: clip.pill.color,
+                                fontFamily: PILL_FONTS[clip.pill.font].family,
+                                // Matches the engine: font = 4.2% of the frame's shorter side × the size %.
+                                fontSize: `calc(${(4.2 * Math.min(4, Math.max(0.3, clip.pill.size / 100))).toFixed(2)} * 1cqmin)`,
+                              }}
                             >
                               {clip.pill.text || 'Text'}
                             </span>
                           )}
+                        />
+                      )}
+
+                      {clip.pill.enabled && clip.pill.text.trim() && (
+                        <PillTiming
+                          start={clip.pill.start}
+                          end={clip.pill.end}
+                          playLen={playSeconds}
+                          disabled={busy}
+                          onChange={(patch) => updatePill(clip, patch)}
                         />
                       )}
 
@@ -1258,6 +1330,7 @@ export default function App() {
                             <button onClick={() => removeRange(r.id)} disabled={busy} aria-label="Remove voiceover">✕</button>
                           </span>
                         </div>
+                        {r.track.status === 'ready' && <AudioFilePreview file={r.track.file} />}
                         <div className="range-span">
                           <span>Plays over</span>
                           <select value={start} disabled={busy} onChange={(e) => updateRange(r.id, { start: Number(e.target.value), end: Math.max(Number(e.target.value), end) })}>
@@ -1270,6 +1343,9 @@ export default function App() {
                             {clips.map((_, idx) => (idx >= start ? <option key={idx} value={idx}>Clip {idx + 1}</option> : null))}
                           </select>
                         </div>
+                        {r.track.status === 'ready' && spanSeconds > 0 && (
+                          <StartOffset value={Math.min(r.startOffset, Math.max(1, spanSeconds))} max={Math.max(1, spanSeconds)} disabled={busy} onChange={(v) => updateRange(r.id, { startOffset: v })} />
+                        )}
                         {overflow > 0.5 && <p className="hint warn">This voiceover is {formatTime(overflow)} longer than clips {start + 1}–{end + 1} and will be cut at the end.</p>}
                       </div>
                     );
@@ -1460,15 +1536,11 @@ export default function App() {
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            <strong>“Download (best quality)” is your {job.outWidth}×{job.outHeight} file</strong> — exactly as made, at the size you chose.
-            {h264Fit?.downscaled ? (
-              <>
-                {' '}“Prepare H.264” makes a copy under 5 MB. This video is {formatTime(job.durationSeconds)} long, so at {job.outWidth}×{job.outHeight} it can't fit 5 MB without becoming blocky — so that copy is {h264Fit.width}×{h264Fit.height} instead, to stay smooth. Trim your clips shorter and the H.264 copy keeps more of the {job.outWidth}×{job.outHeight} size.
-              </>
+            <strong>Both downloads are {job.outWidth}×{job.outHeight}</strong> — the size you chose. “Download (best quality)” is the file exactly as made.
+            {job.size <= H264_MAX_BYTES ? (
+              <> “Prepare H.264” makes a copy under 5 MB; this video already fits, so it's copied at {job.outWidth}×{job.outHeight} with identical quality.</>
             ) : (
-              <>
-                {' '}“Prepare H.264” makes a copy under 5 MB; this video fits, so it's copied at the full {job.outWidth}×{job.outHeight} with identical quality.
-              </>
+              <> “Prepare H.264” makes a copy under 5 MB, still at {job.outWidth}×{job.outHeight}. This video is {formatTime(job.durationSeconds)} long, so to fit 5 MB at that size the picture may look softer — trim your clips shorter, or pick a smaller output size, to keep it crisp.</>
             )}
             {h264.status === 'ready' ? ' Your H.264 file is ready — click “Download H.264”.' : ''}
           </p>

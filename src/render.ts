@@ -62,6 +62,12 @@ export type TextPill = {
   background: string;
   color: string;
   fontFamily: string;
+  /** Text size as a percentage of the default (100 = default); clamped to a sensible range. */
+  size: number;
+  /** When the pill appears and disappears, in seconds from the start of the clip's play time. */
+  start: number;
+  /** End time (seconds from clip start); if it is ≤ start or ≥ the clip length, the pill stays until the clip ends. */
+  end: number;
 };
 
 /** Where and how large an overlay image sits: x/y are its centre (0–1 of the frame), scale its width (0–1). */
@@ -82,13 +88,15 @@ export type RenderClip = {
   transition: Transition;
   /** Plays from the start of this clip and is cut at its end. */
   voiceover?: AudioBuffer;
+  /** Seconds to delay this clip's voiceover past the start of the clip. */
+  voiceOffset?: number;
   pill?: TextPill;
   /** Images shown over this clip (later ones on top), each at its own position and size. */
   images: ({ file: File } & ImagePlacement)[];
 };
 
 /** One voiceover that spans a run of clips, by their position in `clips` (inclusive). */
-export type VoiceRange = { buffer: AudioBuffer; start: number; end: number };
+export type VoiceRange = { buffer: AudioBuffer; start: number; end: number; startOffset?: number };
 
 export type RenderOptions = {
   clips: RenderClip[];
@@ -438,7 +446,9 @@ const wrapText = (ctx: OffscreenCanvasRenderingContext2D, text: string, maxWidth
 const createPill = (ctx: OffscreenCanvasRenderingContext2D, pill: TextPill, width: number, height: number) => {
   const { text, position, background, color, fontFamily } = pill;
   const base = Math.min(width, height);
-  const fontSize = Math.round(base * 0.042);
+  // Size is a percentage of the default; clamp so a pill can't vanish or swamp the frame.
+  const sizeScale = Math.min(4, Math.max(0.3, (pill.size || 100) / 100));
+  const fontSize = Math.round(base * 0.042 * sizeScale);
   const font = `600 ${fontSize}px ${fontFamily}`;
   const padX = fontSize * 0.9;
   const padY = fontSize * 0.55;
@@ -676,7 +686,11 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       const startClip = plan.clips[s];
       const endClip = plan.clips[e];
       if (!startClip || !endClip) return null;
-      return { buffer: range.buffer, start: startClip.start / fps, end: (endClip.start + endClip.frames) / fps };
+      const spanStart = startClip.start / fps;
+      const spanEnd = (endClip.start + endClip.frames) / fps;
+      // The voiceover can be delayed within its span, but never past the end of the span.
+      const start = Math.min(Math.max(spanEnd - 0.1, spanStart), spanStart + Math.max(0, range.startOffset ?? 0));
+      return { buffer: range.buffer, start, end: spanEnd };
     })
     .filter((v): v is { buffer: AudioBuffer; start: number; end: number } => v !== null);
 
@@ -694,8 +708,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     onProgress(progress, stage);
   };
 
-  /** A clip's span on the timeline (seconds) and the audio that belongs to it. */
-  type Segment = { start: number; end: number; envelope: Envelope; fadeOut: number; reader?: ClipAudioReader; voiceover?: AudioBuffer };
+  /** A clip's span on the timeline (seconds) and the audio that belongs to it. `voiceStart` is when its voiceover begins. */
+  type Segment = { start: number; end: number; voiceStart: number; envelope: Envelope; fadeOut: number; reader?: ClipAudioReader; voiceover?: AudioBuffer };
   /** Clips currently on screen — one, or two during a transition. */
   const activeSegments = new Set<Segment>();
 
@@ -747,7 +761,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       }
       if (segment.voiceover) {
         const fade = Math.max(CLIP_VOICE_FADE_OUT, segment.fadeOut);
-        scheduleVoice(context, bus, segment.voiceover, segment.start, segment.end, fade, from, to);
+        scheduleVoice(context, bus, segment.voiceover, segment.voiceStart, segment.end, fade, from, to);
       }
     }
     if (voiceover) {
@@ -846,9 +860,12 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     const start = planned.start / fps;
     const end = (planned.start + planned.frames) / fps;
     const fadeOut = planned.outFrames / fps;
+    // The clip's voiceover can be delayed into the clip, but never past its end.
+    const voiceStart = Math.min(end, start + Math.max(0, clip.voiceOffset ?? 0));
     const segment: Segment = {
       start,
       end,
+      voiceStart,
       fadeOut,
       envelope: clipEnvelope(start, end, planned.inFrames / fps, fadeOut),
       voiceover: clip.voiceover,
@@ -858,6 +875,14 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 
     const speedScale = MOTION_SPEED_SCALE[clip.motionSpeed];
     const drawPill = clip.pill?.text.trim() ? createPill(ctx, clip.pill, width, height) : null;
+    // The pill's own on-screen window (frames), so it can appear partway through and/or leave before the clip ends.
+    const playLen = planned.frames / fps;
+    const pillStartSec = clip.pill ? Math.max(0, Math.min(playLen, clip.pill.start)) : 0;
+    const pillEndRaw = clip.pill ? clip.pill.end : 0;
+    const pillEndSec = pillEndRaw > pillStartSec && pillEndRaw < playLen ? pillEndRaw : playLen;
+    const pillStartFrame = Math.round(pillStartSec * fps);
+    const pillEndFrame = Math.max(pillStartFrame + 1, Math.round(pillEndSec * fps));
+    const pillFadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor((pillEndFrame - pillStartFrame) / 3)));
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
       clip.images.map(async ({ file, x, y, scale }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), place: { x, y, scale } })),
@@ -891,7 +916,16 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         }
         const overlayAlpha = alpha * Math.min(1, k / overlayFadeFrames, (planned.frames - 1 - k) / overlayFadeFrames);
         drawImages.forEach((draw) => draw(overlayAlpha));
-        drawPill?.(overlayAlpha);
+        // The pill fades in/out at the edges of its own window, which may be shorter than the clip.
+        if (drawPill) {
+          let pillAlpha = 0;
+          if (k >= pillStartFrame && k < pillEndFrame) {
+            const fadeIn = (k - pillStartFrame + 0.5) / pillFadeFrames;
+            const fadeOutP = (pillEndFrame - 1 - k + 0.5) / pillFadeFrames;
+            pillAlpha = alpha * Math.min(1, fadeIn, fadeOutP);
+          }
+          drawPill(pillAlpha);
+        }
         ctx.restore();
         k++;
       },
@@ -970,10 +1004,10 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
 /**
  * Produces the optional "Download as H.264" file, a standard H.264 MP4 kept under `maxBytes` (5 MB by default).
  *
- * - If the finished video already fits, its streams are copied across untouched — identical quality, full resolution.
- * - If it is larger, the picture is kept SMOOTH rather than pixelated: the resolution is lowered just enough that the
- *   bitrate the budget allows stays well above the blocking threshold, then the video is re-encoded at that size.
- *   A lower resolution looks clean and soft; it never produces the blocky pixelation of squeezing bitrate at full size.
+ * The resolution is always the size the finished video already has (the size the user chose) — never downscaled.
+ * - If the video already fits, its streams are copied across untouched — identical quality, full resolution.
+ * - If it is larger, it is re-encoded at the SAME resolution with the bitrate the budget allows. A long video then
+ *   gets a lower bitrate and may look softer; trimming it shorter or choosing a smaller output size keeps it crisp.
  *
  * Uses a software encoder and a stall watchdog on Safari/WebKit, whose hardware encoder can hang.
  */
