@@ -21,6 +21,7 @@ import {
   Output,
   StreamTarget,
   type StreamTargetChunk,
+  type VideoCodec,
   type WrappedAudioBuffer,
 } from 'mediabunny';
 
@@ -30,6 +31,7 @@ import {
   h264FitSize,
   planTimeline,
   type ClipInfo,
+  type DownloadCodec,
   type Motion,
   type MotionSpeed,
   type PillPosition,
@@ -1034,63 +1036,69 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   }
 }
 
+/** The finished smaller-file download, with the codec it actually used ('av1' | 'hevc' | 'avc'). */
+export type CompressedResult = { blob: Blob; codec: string };
+
 /**
- * Produces the optional "Download as H.264" file, a standard H.264 MP4 kept under `maxBytes` (5 MB by default).
+ * Produces the optional "smaller file" download, kept under `maxBytes` (5 MB by default), at the SAME resolution
+ * and framing as the finished video — the picture is never downscaled, so the view the user set is unchanged.
  *
- * The resolution is always the size the finished video already has (the size the user chose) — never downscaled.
- * - If the video already fits, its streams are copied across untouched — identical quality, full resolution.
- * - If it is larger, it is re-encoded at the SAME resolution with the bitrate the budget allows. A long video then
- *   gets a lower bitrate and may look softer; trimming it shorter or choosing a smaller output size keeps it crisp.
+ * Size is reduced two ways:
+ * - Codec: `codecPref` picks the codec, or 'auto' chooses the most efficient one this browser can ENCODE —
+ *   AV1 (smallest), then HEVC/H.265, then H.264 — always falling back to H.264. Modern codecs cut the size
+ *   (or lift the quality at the same size) sharply versus H.264, which is why a long video no longer looks soft.
+ * - Bitrate: the exact target bitrate the budget allows for this length (`h264FitSize`) is set on the encoder.
+ *   WebCodecs is single-pass (no true 2-pass VBR, which would need a server), but setting the computed target
+ *   bitrate on a modern codec captures almost all of the benefit.
  *
- * Uses a software encoder and a stall watchdog on Safari/WebKit, whose hardware encoder can hang.
+ * If the video already fits and no specific modern codec was requested, the H.264 streams are copied untouched
+ * (identical quality). Audio is copied in every case. A stall watchdog cancels a hung encoder instead of waiting.
  */
-export async function transcodeH264(
+export async function transcodeCompressed(
   source: Blob,
   maxBytes = H264_MAX_BYTES,
+  codecPref: DownloadCodec = 'auto',
   signal?: AbortSignal,
   onProgress?: (fraction: number) => void,
-): Promise<Blob> {
+): Promise<CompressedResult> {
   const input = new Input({ source: new BlobSource(source), formats: [MP4] });
   try {
     const target = new BufferTarget();
     const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
 
-    let video: {
-      codec: 'avc';
-      quality?: typeof QUALITY_VERY_HIGH;
-      width?: number;
-      height?: number;
-      fit?: 'contain';
-      bitrate?: number;
-      keyFrameInterval?: number;
-      hardwareAcceleration?: 'prefer-software';
-    };
-    if (source.size <= maxBytes) {
-      // Already small enough → copy the already-H.264 streams untouched (identical quality, full resolution).
-      video = { codec: 'avc', quality: QUALITY_VERY_HIGH };
-    } else {
-      const track = (await input.getPrimaryVideoTrack())!;
-      const [w, h, duration, metrics] = await Promise.all([
-        track.getDisplayWidth(),
-        track.getDisplayHeight(),
-        input.computeDuration(),
-        track.computeFrameRateMetrics(),
-      ]);
-      // Same formula the UI uses to show the resolution before preparing, so the two always match.
-      const fit = h264FitSize(w, h, metrics.bestGuessFrameRate, duration, maxBytes);
-      video = {
-        codec: 'avc',
-        bitrate: fit.bitrate,
-        keyFrameInterval: 2,
-        ...(fit.downscaled ? { width: fit.width, height: fit.height, fit: 'contain' as const } : {}),
-        ...(IS_WEBKIT ? { hardwareAcceleration: 'prefer-software' as const } : {}),
-      };
-    }
+    const track = (await input.getPrimaryVideoTrack())!;
+    const [w, h, duration, metrics] = await Promise.all([
+      track.getDisplayWidth(),
+      track.getDisplayHeight(),
+      input.computeDuration(),
+      track.computeFrameRateMetrics(),
+    ]);
+    // Full resolution kept; only the bitrate is set from the budget (same formula the UI shows before preparing).
+    const fit = h264FitSize(w, h, metrics.bestGuessFrameRate, duration, maxBytes);
 
-    // Audio is copied across untouched (not re-encoded), so its quality is unchanged either way.
+    // Choose the codec: the user's pick, or the most efficient one the browser can encode at this size/bitrate.
+    const order: VideoCodec[] = codecPref === 'auto' ? ['av1', 'hevc', 'avc'] : [codecPref];
+    const codecOpts = { width: w, height: h, bitrate: fit.bitrate };
+    let codec = await getFirstEncodableVideoCodec(order, codecOpts);
+    if (!codec) codec = await getFirstEncodableVideoCodec(['avc'], codecOpts); // H.264 is the universal fallback
+    if (!codec) throw new Error('This browser cannot encode a compressed video. Use “Download (best quality)”.');
+
+    // Already under budget and no modern codec specifically asked for → copy the H.264 streams untouched.
+    const copy = source.size <= maxBytes && codec === 'avc' && (codecPref === 'auto' || codecPref === 'avc');
+    const video = copy
+      ? { codec: 'avc' as const, quality: QUALITY_VERY_HIGH }
+      : {
+          codec,
+          bitrate: fit.bitrate,
+          keyFrameInterval: 2,
+          // Safari's H.264 hardware encoder can hang; its HEVC one is fine, so only soften H.264 there.
+          ...(IS_WEBKIT && codec === 'avc' ? { hardwareAcceleration: 'prefer-software' as const } : {}),
+        };
+
+    // Audio is copied across untouched (not re-encoded), so its quality is unchanged.
     const conversion = await Conversion.init({ input, output, video });
 
-    // Watchdog: if progress stops for 25 s, cancel instead of hanging.
+    // Watchdog: if progress stops for 40 s (AV1 software can be slow to start), cancel instead of hanging.
     let lastTick = Date.now();
     conversion.onProgress = (p) => {
       lastTick = Date.now();
@@ -1099,7 +1107,7 @@ export async function transcodeH264(
     const onAbort = () => void conversion.cancel();
     signal?.addEventListener('abort', onAbort, { once: true });
     const watchdog = setInterval(() => {
-      if (Date.now() - lastTick > 25_000) {
+      if (Date.now() - lastTick > 40_000) {
         clearInterval(watchdog);
         void conversion.cancel();
       }
@@ -1107,12 +1115,12 @@ export async function transcodeH264(
 
     try {
       await conversion.execute();
-      return new Blob([target.buffer!], { type: 'video/mp4' });
+      return { blob: new Blob([target.buffer!], { type: 'video/mp4' }), codec };
     } catch (error) {
       if (error instanceof ConversionCanceledError) {
         if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         // Not a user cancel → the watchdog fired.
-        throw new Error('The H.264 step stopped responding. Use the “Download (best quality)” button, or try Chrome or Edge.');
+        throw new Error('The compression step stopped responding. Try the “H.264” codec, or use “Download (best quality)”.');
       }
       throw error;
     } finally {

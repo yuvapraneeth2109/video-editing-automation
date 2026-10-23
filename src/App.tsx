@@ -9,12 +9,14 @@ import {
   type ClipInfo,
   type Motion,
   type MotionSpeed,
+  CODEC_SHORT,
   CUSTOM_SIZE_LIMITS,
-  H264_MAX_BYTES,
+  DOWNLOAD_CODEC_LABELS,
+  DOWNLOAD_SIZE_MB,
   PILL_FONTS,
   QUALITY_LABELS,
   customSize,
-  h264FitSize,
+  type DownloadCodec,
   type PillFont,
   type PillPosition,
   type Quality,
@@ -689,14 +691,17 @@ export default function App() {
   const [job, setJob] = useState<DoneOrError>({ state: 'idle' });
   const [dragging, setDragging] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  // Optional H.264 file (max 5 MB), prepared from the finished video only when the user asks for it.
+  // Optional smaller-file download, prepared from the finished video only when the user asks for it.
   const [h264, setH264] = useState<
     | { status: 'idle' }
     | { status: 'working'; progress: number }
-    | { status: 'ready'; url: string; size: number }
+    | { status: 'ready'; url: string; size: number; codec: string }
     | { status: 'error'; message: string }
   >({ status: 'idle' });
   const h264Abort = useRef<AbortController | null>(null);
+  // Smaller-file download settings: which codec, and the size budget (2 MB mobile / 5 MB desktop).
+  const [downloadCodec, setDownloadCodec] = useState<DownloadCodec>('auto');
+  const [downloadMB, setDownloadMB] = useState(5);
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
   const busy = job.state === 'rendering';
@@ -731,14 +736,9 @@ export default function App() {
   const aspect = outputSize.width / outputSize.height;
   const firstPreview = ready[0]?.preview ?? null;
 
-  // The resolution the H.264 ≤5 MB download will produce, shown up front so it is never a surprise:
-  // a video that already fits keeps its full size; a longer one is scaled down to stay smooth under 5 MB.
-  const h264Fit =
-    job.state === 'done'
-      ? job.size <= H264_MAX_BYTES
-        ? { width: job.outWidth, height: job.outHeight, downscaled: false }
-        : h264FitSize(job.outWidth, job.outHeight, job.videoFps, job.durationSeconds)
-      : null;
+  // The smaller-file download keeps the exact size the user chose (never downscaled), so the view is unchanged.
+  const targetBytes = downloadMB * 1024 * 1024;
+  const downloadFits = job.state === 'done' && job.size <= targetBytes;
 
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion' | 'motionSpeed'>(key: K) =>
@@ -1040,12 +1040,14 @@ export default function App() {
     h264Abort.current = controller;
     setH264({ status: 'working', progress: 0 });
     try {
-      const { transcodeH264 } = await loadEngine();
-      const blob = await transcodeH264(job.blob, undefined, controller.signal, (progress) => setH264({ status: 'working', progress }));
-      setH264({ status: 'ready', url: URL.createObjectURL(blob), size: blob.size });
+      const { transcodeCompressed } = await loadEngine();
+      const { blob, codec } = await transcodeCompressed(job.blob, downloadMB * 1024 * 1024, downloadCodec, controller.signal, (progress) =>
+        setH264({ status: 'working', progress }),
+      );
+      setH264({ status: 'ready', url: URL.createObjectURL(blob), size: blob.size, codec });
     } catch (e) {
       if (controller.signal.aborted) setH264({ status: 'idle' });
-      else setH264({ status: 'error', message: e instanceof Error ? e.message : 'Could not create the H.264 file.' });
+      else setH264({ status: 'error', message: e instanceof Error ? e.message : 'Could not create the smaller file.' });
     } finally {
       h264Abort.current = null;
     }
@@ -1638,31 +1640,59 @@ export default function App() {
             </span>
           </div>
           <video className="preview" src={job.url} controls playsInline />
+          <div className="download-opts">
+            <label>
+              Smaller file — codec
+              <select
+                value={downloadCodec}
+                disabled={h264.status === 'working'}
+                onChange={(e) => {
+                  setDownloadCodec(e.target.value as DownloadCodec);
+                  setH264({ status: 'idle' });
+                }}
+              >
+                {(Object.keys(DOWNLOAD_CODEC_LABELS) as DownloadCodec[]).map((c) => (
+                  <option key={c} value={c}>{DOWNLOAD_CODEC_LABELS[c]}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Target size
+              <select
+                value={downloadMB}
+                disabled={h264.status === 'working'}
+                onChange={(e) => {
+                  setDownloadMB(Number(e.target.value));
+                  setH264({ status: 'idle' });
+                }}
+              >
+                {DOWNLOAD_SIZE_MB.map((mb) => (
+                  <option key={mb} value={mb}>{mb} MB {mb === 2 ? '(mobile)' : '(desktop)'}</option>
+                ))}
+              </select>
+            </label>
+          </div>
           <div className="row">
             <a className="button primary" href={job.url} download={downloadName()}>
               Download (best quality) · {job.outWidth}×{job.outHeight}
             </a>
             {h264.status === 'ready' ? (
-              <a className="button secondary" href={h264.url} download={downloadName('-h264')}>
-                Download H.264 ({formatBytes(h264.size)}{h264Fit ? ` · ${h264Fit.width}×${h264Fit.height}` : ''})
+              <a className="button secondary" href={h264.url} download={downloadName(`-${(CODEC_SHORT[h264.codec] || 'small').toLowerCase()}`)}>
+                Download {CODEC_SHORT[h264.codec] || 'file'} ({formatBytes(h264.size)} · {job.outWidth}×{job.outHeight})
               </a>
             ) : h264.status === 'working' ? (
-              <span className="button secondary" aria-busy="true">Preparing H.264… {Math.round(h264.progress * 100)}%</span>
+              <span className="button secondary" aria-busy="true">Preparing… {Math.round(h264.progress * 100)}%</span>
             ) : (
               <button className="secondary" onClick={prepareH264}>
-                Prepare H.264 (max 5 MB{h264Fit ? ` · ${h264Fit.width}×${h264Fit.height}` : ''})
+                Prepare smaller file (≤{downloadMB} MB · {job.outWidth}×{job.outHeight})
               </button>
             )}
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            <strong>Both downloads are {job.outWidth}×{job.outHeight}</strong> — the size you chose. “Download (best quality)” is the file exactly as made.
-            {job.size <= H264_MAX_BYTES ? (
-              <> “Prepare H.264” makes a copy under 5 MB; this video already fits, so it's copied at {job.outWidth}×{job.outHeight} with identical quality.</>
-            ) : (
-              <> “Prepare H.264” makes a copy under 5 MB, still at {job.outWidth}×{job.outHeight}. This video is {formatTime(job.durationSeconds)} long, so to fit 5 MB at that size the picture may look softer — trim your clips shorter, or pick a smaller output size, to keep it crisp.</>
-            )}
-            {h264.status === 'ready' ? ' Your H.264 file is ready — click “Download H.264”.' : ''}
+            <strong>“Download (best quality)” is your {job.outWidth}×{job.outHeight} H.264 file</strong> — exactly as made, plays everywhere. The smaller file keeps the same {job.outWidth}×{job.outHeight} view but squeezes it under {downloadMB} MB using a modern codec (Auto picks AV1 or H.265 when your browser can make them, else H.264), so it looks far cleaner than H.264 at the same size.
+            {downloadFits && (downloadCodec === 'auto' || downloadCodec === 'avc') ? ' This video already fits, so Auto/H.264 copies it with no quality loss — pick AV1 or H.265 to shrink it further.' : ''}
+            {' '}AV1/H.265 play in modern players and phones; use H.264 (or best quality) for the widest compatibility.
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>

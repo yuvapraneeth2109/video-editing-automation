@@ -190,6 +190,11 @@ button.link:disabled { opacity: 0.5; }
 .offset input[type='range'] { width: 100%; accent-color: var(--blue); }
 .audio-slot { display: grid; gap: 8px; }
 .audio-preview { width: 100%; height: 34px; }
+/* Smaller-file download options (codec + target size). */
+.download-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 4px 0 12px; }
+.download-opts label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+.download-opts select { width: 100%; }
+@media (max-width: 520px) { .download-opts { grid-template-columns: 1fr; } }
 .place-pill.other { opacity: 0.4; }
 /* Multiple captions per clip. */
 .pills { display: grid; gap: 10px; }
