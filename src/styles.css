@@ -190,6 +190,18 @@ button.link:disabled { opacity: 0.5; }
 .offset input[type='range'] { width: 100%; accent-color: var(--blue); }
 .audio-slot { display: grid; gap: 8px; }
 .audio-preview { width: 100%; height: 34px; }
+/* Start chooser (Excel vs manual) and the Excel intake. */
+.chooser { display: grid; gap: 14px; }
+.chooser-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.choice { display: grid; gap: 6px; text-align: left; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); cursor: pointer; }
+.choice:hover:not(:disabled) { border-color: var(--blue); }
+.choice strong { font-size: 16px; }
+.intake { display: grid; gap: 14px; }
+.intake-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.dropzone.small { min-height: 110px; gap: 6px; }
+.intake-actions { display: flex; gap: 14px; align-items: center; }
+.warn-list { margin: 6px 0; padding-left: 18px; font-size: 13px; }
+@media (max-width: 560px) { .chooser-grid, .intake-grid { grid-template-columns: 1fr; } }
 /* Smaller-file download options (codec + target size). */
 .download-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 4px 0 12px; }
 .download-opts label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }

@@ -115,6 +115,25 @@ const PILL_SIZE = { min: 40, max: 250, step: 5 };
 const makePill = (style: PillStyle): Pill => ({ id: crypto.randomUUID(), text: '', position: { ...CENTER_BOTTOM }, start: 0, end: 0, ...style });
 /** The CSS font-size (in cqmin) for a pill preview, matching the engine's base×0.042×size maths. */
 const pillPreviewFont = (size: number) => `calc(${(4.2 * Math.min(4, Math.max(0.3, size / 100))).toFixed(2)} * 1cqmin)`;
+
+/** The file's name without any folder path, for matching Excel references against uploaded files. */
+const baseName = (p: string) => p.replace(/^.*[\\/]/, '').trim();
+/** Normalises a hex colour from the Excel ('0f1115' or '#0F1115') to '#rrggbb', or a fallback. */
+const normHex = (v: string, dflt: string) => {
+  const s = (v || '').trim().replace(/^#/, '');
+  return /^[0-9a-fA-F]{6}$/.test(s) ? `#${s.toLowerCase()}` : dflt;
+};
+/** Snaps a number to the nearest value the matching dropdown offers. */
+const snap = (v: number, opts: readonly number[]) => opts.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a), opts[0]);
+/** Turns an Excel output-size string into a preset name (if it is one of the two) or a custom width/height. */
+const parseSize = (s: string): { preset?: string; width: number; height: number } => {
+  const m = String(s).toLowerCase().match(/(\d{2,5})\s*[x×*]\s*(\d{2,5})/);
+  const width = m ? Number(m[1]) : 960;
+  const height = m ? Number(m[2]) : 960;
+  if (width === 960 && height === 960) return { preset: '960 × 960 px (required)', width, height };
+  if (width === 1024 && height === 1024) return { preset: '1024 × 1024 px (maximum)', width, height };
+  return { width, height };
+};
 const PILL_FONT_KEYS = Object.keys(PILL_FONTS) as PillFont[];
 const PHOTO_SECONDS = { default: 4, min: 1, max: 60 };
 const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif|heic)$/i.test(f.name);
@@ -668,6 +687,12 @@ function TrimControl({ clip, disabled, onChange }: { clip: Clip & { status: 'rea
 
 export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
+  // Which entry path the user is in: the initial chooser, the Excel-automation intake, or the manual editor.
+  const [mode, setMode] = useState<'choose' | 'excel' | 'manual'>('choose');
+  const [excelFile, setExcelFile] = useState<File | null>(null);
+  const [excelMedia, setExcelMedia] = useState<File[]>([]);
+  const [excelStatus, setExcelStatus] = useState<{ state: 'idle' | 'building' | 'error'; message?: string }>({ state: 'idle' });
+  const [ingestWarnings, setIngestWarnings] = useState<string[]>([]);
   const [logoOverlay, setLogoOverlay] = useState<Overlay | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
   const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
@@ -1053,6 +1078,223 @@ export default function App() {
     }
   };
 
+  /** Download the sample/template workbook — the exact format the Excel intake reads. */
+  const downloadSample = async () => {
+    const { sampleWorkbookBlob } = await import('./excel');
+    const url = URL.createObjectURL(await sampleWorkbookBlob());
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'roothoot-video-template.xlsx';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
+  /** Reads the uploaded Excel + media and builds a complete project, then lands in the editor ready to export. */
+  const buildFromExcel = async () => {
+    if (!excelFile || !excelMedia.length || excelStatus.state === 'building') return;
+    setExcelStatus({ state: 'building' });
+    try {
+      const { parseWorkbook } = await import('./excel');
+      const engine = await loadEngine();
+      const bp = await parseWorkbook(await excelFile.arrayBuffer());
+
+      const media = new Map<string, File>();
+      for (const f of excelMedia) media.set(baseName(f.name).toLowerCase(), f);
+      const grab = (name: string) => media.get(baseName(name).toLowerCase());
+
+      // Report every missing file at once, rather than failing on the first.
+      const missing = new Set<string>();
+      const need = (name: string) => {
+        if (name && !grab(name)) missing.add(name);
+      };
+      bp.clips.forEach((c) => need(c.file));
+      bp.images.forEach((i) => need(i.file));
+      bp.voices.forEach((v) => need(v.file));
+      need(bp.settings.watermarkFile);
+      need(bp.settings.musicFile);
+      if (!bp.clips.length) {
+        setExcelStatus({ state: 'error', message: 'The Excel has no clips — add rows to the “Clips” sheet (at least a File for each).' });
+        return;
+      }
+      if (missing.size) {
+        setExcelStatus({ state: 'error', message: `These files named in the Excel weren't among the uploaded files: ${[...missing].join(', ')}.` });
+        return;
+      }
+
+      // Clear any project already loaded.
+      clips.forEach(freeClip);
+      if (logoOverlay) URL.revokeObjectURL(logoOverlay.url);
+
+      const orderToId = new Map<number, string>();
+      const built: Clip[] = [];
+      const pending: { id: string; file: File; photo: boolean; trimStart?: number; trimEnd?: number; photoSeconds?: number }[] = [];
+
+      for (const bc of bp.clips) {
+        const file = grab(bc.file)!;
+        const photo = isPhoto(file);
+        const id = crypto.randomUUID();
+        orderToId.set(bc.order, id);
+        const pills: Pill[] = bp.pills
+          .filter((p) => p.clip === bc.order)
+          .map((p) => ({
+            id: crypto.randomUUID(),
+            text: p.text,
+            position: { x: clamp01(p.x / 100), y: clamp01(p.y / 100) },
+            start: Math.max(0, p.start),
+            end: Math.max(0, p.end),
+            background: normHex(p.background, '#0f1115'),
+            opacity: clamp(0, 100, p.opacity),
+            color: normHex(p.textColor, '#ffffff'),
+            font: (PILL_FONT_KEYS.includes(p.font as PillFont) ? p.font : 'system') as PillFont,
+            size: clamp(PILL_SIZE.min, PILL_SIZE.max, p.size),
+          }));
+        const images: Overlay[] = bp.images
+          .filter((im) => im.clip === bc.order)
+          .map((im) => {
+            const f = grab(im.file)!;
+            return { id: crypto.randomUUID(), file: f, url: URL.createObjectURL(f), x: clamp01(im.x / 100), y: clamp01(im.y / 100), scale: clamp(0.05, 1, im.size / 100), status: 'loading' as const };
+          });
+        built.push({
+          id,
+          file,
+          preview: null,
+          status: 'probing',
+          voiceover: null,
+          voiceOffset: 0,
+          voiceTrim: { start: 0, end: 0 },
+          images,
+          pills,
+          motion: bc.motion as Motion,
+          motionSpeed: bc.motionSpeed as MotionSpeed,
+          trim: { start: 0, end: 0 },
+          transition: (bc.transition ?? bp.settings.transition) as Transition,
+        } as Clip);
+        pending.push({ id, file, photo, trimStart: bc.trimStart, trimEnd: bc.trimEnd, photoSeconds: bc.photoSeconds });
+      }
+
+      // Settings → editor state.
+      const sz = parseSize(bp.settings.outputSize);
+      if (sz.preset) setPreset(sz.preset);
+      else {
+        setPreset(CUSTOM_PRESET);
+        setCustom(customSize(sz.width, sz.height));
+      }
+      setLogoSeconds(snap(bp.settings.logoSeconds, LOGO_SECONDS));
+      setTransitionSeconds(snap(bp.settings.transitionSeconds, TRANSITION_SECONDS));
+      setFastFps(bp.settings.frameRate === 'fast');
+      setDefaults((d) => ({ ...d, transition: bp.settings.transition as Transition }));
+      setClipVolume(clamp(0, 100, bp.settings.clipVolume));
+      setVoiceVolume(clamp(0, 100, bp.settings.voiceVolume));
+      setMusicVolume(clamp(0, 100, bp.settings.musicVolume));
+      setDownloadCodec(bp.settings.downloadCodec);
+      setDownloadMB(bp.settings.targetSizeMB >= 4 ? 5 : 2);
+      setVoiceMode(bp.settings.voiceMode);
+
+      // Watermark logo.
+      if (bp.settings.watermarkFile) {
+        const wf = grab(bp.settings.watermarkFile)!;
+        const url = URL.createObjectURL(wf);
+        setLogoOverlay({ id: 'logo', file: wf, url, x: clamp01(bp.settings.watermarkX / 100), y: clamp01(bp.settings.watermarkY / 100), scale: clamp(0.02, 1, bp.settings.watermarkSize / 100), status: 'loading' });
+        engine.probeImage(wf).then(
+          (s) => setLogoOverlay((o) => (o && o.file === wf ? ({ ...o, status: 'ready', ...s } as Overlay) : o)),
+          (e: Error) => setLogoOverlay((o) => (o && o.file === wf ? ({ ...o, status: 'error', error: e.message } as Overlay) : o)),
+        );
+      } else setLogoOverlay(null);
+
+      // Music.
+      if (bp.settings.musicFile) {
+        const mf = grab(bp.settings.musicFile)!;
+        setMusic({ file: mf, status: 'loading' });
+        setMusicStartOffset(Math.max(0, bp.settings.musicStartOffset));
+        engine.loadAudio(mf).then(
+          (buffer) => setMusic((c) => (c?.file === mf ? { file: mf, status: 'ready', buffer } : c)),
+          (e: Error) => setMusic((c) => (c?.file === mf ? { file: mf, status: 'error', error: e.message } : c)),
+        );
+      } else setMusic(null);
+
+      // Voiceovers, by the chosen mode.
+      setVoiceover(null);
+      setRanges([]);
+      if (bp.settings.voiceMode === 'whole') {
+        const v = bp.voices[0];
+        if (v) {
+          const f = grab(v.file)!;
+          setVoiceTrim({ start: Math.max(0, v.trimStart), end: Math.max(0, v.trimEnd) });
+          setVoiceStartOffset(Math.max(0, v.startOffset));
+          setVoiceover({ file: f, status: 'loading' });
+          engine.loadAudio(f).then(
+            (buffer) => setVoiceover((c) => (c?.file === f ? { file: f, status: 'ready', buffer } : c)),
+            (e: Error) => setVoiceover((c) => (c?.file === f ? { file: f, status: 'error', error: e.message } : c)),
+          );
+        }
+      } else if (bp.settings.voiceMode === 'ranges') {
+        const rangesBuilt: VoiceRange[] = bp.voices.map((v) => {
+          const f = grab(v.file)!;
+          const from = v.fromClip ?? v.clip ?? bp.clips[0].order;
+          const to = v.toClip ?? v.clip ?? from;
+          const startIdx = Math.max(0, bp.clips.findIndex((c) => c.order === from));
+          const endIdxRaw = bp.clips.findIndex((c) => c.order === to);
+          const id = crypto.randomUUID();
+          const range: VoiceRange = { id, track: { file: f, status: 'loading' }, start: startIdx, end: endIdxRaw < 0 ? startIdx : Math.max(startIdx, endIdxRaw), startOffset: Math.max(0, v.startOffset), trim: { start: Math.max(0, v.trimStart), end: Math.max(0, v.trimEnd) } };
+          engine.loadAudio(f).then(
+            (buffer) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, track: { file: f, status: 'ready', buffer } } : r))),
+            (e: Error) => setRanges((prev) => prev.map((r) => (r.id === id ? { ...r, track: { file: f, status: 'error', error: e.message } } : r))),
+          );
+          return range;
+        });
+        setRanges(rangesBuilt);
+      } else {
+        for (const v of bp.voices) {
+          if (v.clip == null) continue;
+          const cid = orderToId.get(v.clip);
+          if (!cid) continue;
+          const f = grab(v.file)!;
+          const idx = built.findIndex((c) => c.id === cid);
+          if (idx >= 0) built[idx] = { ...built[idx], voiceover: { file: f, status: 'loading' }, voiceOffset: Math.max(0, v.startOffset), voiceTrim: { start: Math.max(0, v.trimStart), end: Math.max(0, v.trimEnd) } };
+          engine.loadAudio(f).then(
+            (buffer) => setClips((prev) => prev.map((c) => (c.id === cid && c.voiceover?.file === f ? { ...c, voiceover: { file: f, status: 'ready', buffer } } : c))),
+            (e: Error) => setClips((prev) => prev.map((c) => (c.id === cid && c.voiceover?.file === f ? { ...c, voiceover: { file: f, status: 'error', error: e.message } } : c))),
+          );
+        }
+        if (bp.voices.length) setClipVolume((v) => Math.min(v, CLIP_VOLUME_UNDER_VOICE));
+      }
+
+      // Commit clips, then probe each (size, duration, thumbnail, overlay images) in the background.
+      setClips(built);
+      setJob({ state: 'idle' });
+      setIngestWarnings(bp.warnings);
+      setMode('manual');
+      setExcelStatus({ state: 'idle' });
+
+      for (const pc of pending) {
+        const probe = pc.photo
+          ? engine.probeImage(pc.file).then(({ width, height }) => ({ width, height, duration: Math.max(PHOTO_SECONDS.min, Math.min(PHOTO_SECONDS.max, pc.photoSeconds ?? PHOTO_SECONDS.default)), fps: NaN }))
+          : engine.probeClip(pc.file);
+        probe.then(
+          (info) => {
+            const trim = pc.photo
+              ? { start: 0, end: 0 }
+              : {
+                  start: clamp(0, Math.max(0, info.duration - 0.2), pc.trimStart ?? 0),
+                  end: pc.trimEnd != null && pc.trimEnd > 0 ? clamp(0.2, info.duration, pc.trimEnd) : info.duration,
+                };
+            update(pc.id, { status: 'ready', info, photo: pc.photo, trim } as Partial<Clip>);
+            engine.makeThumbnail(pc.file, pc.photo).then((preview) => update(pc.id, { preview }), () => {});
+          },
+          (e: Error) => update(pc.id, { status: 'error', error: e.message }),
+        );
+      }
+      for (const c of built) for (const o of c.images) {
+        engine.probeImage(o.file).then(
+          (size) => updateImage(c.id, o.id, { status: 'ready', ...size }),
+          (e: Error) => updateImage(c.id, o.id, { status: 'error', error: e.message }),
+        );
+      }
+    } catch (e) {
+      setExcelStatus({ state: 'error', message: e instanceof Error ? e.message : 'Could not read that Excel file.' });
+    }
+  };
+
   const reset = () => {
     void loadEngine().then(({ clearExports }) => clearExports());
     clips.forEach(freeClip);
@@ -1063,6 +1305,11 @@ export default function App() {
     setMusic(null);
     setH264({ status: 'idle' });
     setJob({ state: 'idle' });
+    setIngestWarnings([]);
+    setExcelFile(null);
+    setExcelMedia([]);
+    setExcelStatus({ state: 'idle' });
+    setMode('choose');
   };
 
   return (
@@ -1076,6 +1323,84 @@ export default function App() {
       </header>
 
       {!SUPPORTED && <div className="notice error">This browser can't encode video. Please use the latest Chrome, Edge or Safari.</div>}
+
+      {mode === 'choose' && (
+        <section className="card chooser">
+          <h2>How do you want to start?</h2>
+          <div className="chooser-grid">
+            <button className="choice" onClick={() => setMode('excel')}>
+              <strong>Add Excel and files</strong>
+              <span className="muted">Upload a blueprint spreadsheet and all your media — the video is built automatically, no manual editing.</span>
+            </button>
+            <button className="choice" onClick={() => setMode('manual')}>
+              <strong>Manually edit</strong>
+              <span className="muted">Build the video by hand — add clips, trims, captions, voiceovers and settings yourself.</span>
+            </button>
+          </div>
+        </section>
+      )}
+
+      {mode === 'excel' && (
+        <section className="card intake">
+          <div className="card-head">
+            <h2>Add Excel and files</h2>
+            <button className="link" onClick={() => setMode('choose')}>← Back</button>
+          </div>
+          <p className="muted">Upload the blueprint spreadsheet, then all your media (videos, photos, audio, logo). The file names written in the Excel must match the uploaded files.</p>
+          <div className="intake-grid">
+            <label className="dropzone small">
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                hidden
+                onChange={(e) => {
+                  setExcelFile(e.target.files?.[0] ?? null);
+                  setExcelStatus({ state: 'idle' });
+                  e.target.value = '';
+                }}
+              />
+              <strong>1 · Excel blueprint</strong>
+              <span className="muted">{excelFile ? excelFile.name : '.xlsx or .csv — clips, pills, voiceovers, settings'}</span>
+            </label>
+            <label className="dropzone small">
+              <input
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => {
+                  setExcelMedia(Array.from(e.target.files ?? []));
+                  setExcelStatus({ state: 'idle' });
+                  e.target.value = '';
+                }}
+              />
+              <strong>2 · All media files</strong>
+              <span className="muted">{excelMedia.length ? `${excelMedia.length} file${excelMedia.length > 1 ? 's' : ''} selected` : 'videos, photos, audio, logo — select them all'}</span>
+            </label>
+          </div>
+          <div className="intake-actions">
+            <button className="link" onClick={downloadSample}>⬇ Download sample Excel template</button>
+          </div>
+          {excelStatus.state === 'error' && <p className="hint error">{excelStatus.message}</p>}
+          <button className="primary" disabled={!SUPPORTED || !excelFile || !excelMedia.length || excelStatus.state === 'building'} onClick={buildFromExcel}>
+            {excelStatus.state === 'building' ? 'Building your video…' : 'Build the video →'}
+          </button>
+          <p className="hint muted">Everything runs on your device — no server, no cost. After building, you land in the editor with everything filled in, ready to export (and free to tweak).</p>
+        </section>
+      )}
+
+      {mode === 'manual' && (
+      <>
+      {ingestWarnings.length > 0 && (
+        <div className="notice">
+          <strong>Built from your Excel.</strong> {ingestWarnings.length} note{ingestWarnings.length > 1 ? 's' : ''}:
+          <ul className="warn-list">
+            {ingestWarnings.map((w, i) => (
+              <li key={i}>{w}</li>
+            ))}
+          </ul>
+          <button className="link" onClick={() => setIngestWarnings([])}>Dismiss</button>
+        </div>
+      )}
 
       <label
         className={`dropzone${dragging ? ' active' : ''}${busy ? ' disabled' : ''}`}
@@ -1696,6 +2021,8 @@ export default function App() {
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>
+      )}
+      </>
       )}
     </div>
   );
