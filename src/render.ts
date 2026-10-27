@@ -114,6 +114,8 @@ export type RenderOptions = {
   logoSeconds: number;
   transitionSeconds: number;
   quality: Quality;
+  /** How each clip fills the output frame: 'contain' letterboxes (black bars), 'cover' crops to fill. Defaults to 'contain'. */
+  fill?: 'contain' | 'cover';
   /** A watermark/logo shown at a fixed spot on every clip frame, for the whole video. */
   logoOverlay?: { file: File } & ImagePlacement;
   /** Volumes (0–1) of the clips' own sound, every voiceover, and the music. */
@@ -634,6 +636,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
   const { clips, logo, size, fps, logoSeconds, transitionSeconds, clipVolume, voiceVolume, musicVolume, voiceover, music, signal, onProgress } =
     options;
   const { width, height } = size;
+  // How clips fill the square: contain = letterbox, cover = crop to fill.
+  const fill = options.fill ?? 'contain';
   // Trim the whole-video voiceover down to its chosen span once, up front.
   const wholeVoice = voiceover ? sliceBuffer(voiceover, options.voiceTrim) : undefined;
   let progress = 0;
@@ -849,7 +853,8 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
     g.imageSmoothingQuality = 'high';
     g.fillStyle = '#000000';
     g.fillRect(0, 0, width, height);
-    const s = Math.min(width / bitmap.width, height / bitmap.height);
+    // 'cover' crops to fill the frame; 'contain' letterboxes.
+    const s = fill === 'cover' ? Math.max(width / bitmap.width, height / bitmap.height) : Math.min(width / bitmap.width, height / bitmap.height);
     g.drawImage(bitmap, (width - bitmap.width * s) / 2, (height - bitmap.height * s) / 2, bitmap.width * s, bitmap.height * s);
     bitmap.close();
     return { next: async () => still, close: () => {} };
@@ -866,7 +871,7 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
       // Read the clip's audio starting at the trim point so sound and picture stay aligned.
       segment.reader = new ClipAudioReader(new AudioBufferSink(audioTrack).buffers(from), from);
     }
-    const sink = new CanvasSink(videoTrack, { width, height, fit: 'contain', poolSize: 2 });
+    const sink = new CanvasSink(videoTrack, { width, height, fit: fill, poolSize: 2 });
     const canvases = sink.canvasesAtTimestamps(
       (function* () {
         for (let i = 0; i < frames; i++) yield from + i / fps;

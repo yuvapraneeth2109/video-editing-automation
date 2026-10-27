@@ -28,6 +28,7 @@ export type BpSettings = {
   watermarkSize: number;
   downloadCodec: 'auto' | 'av1' | 'hevc' | 'avc';
   targetSizeMB: number;
+  fill: 'contain' | 'cover';
 };
 
 export type BpClip = {
@@ -92,6 +93,7 @@ const DEFAULT_SETTINGS: BpSettings = {
   watermarkSize: 18,
   downloadCodec: 'auto',
   targetSizeMB: 5,
+  fill: 'contain',
 };
 
 const MOTIONS = ['none', 'zoom-in', 'zoom-out', 'zoom-in-out', 'pan-left', 'pan-right', 'pan-up', 'pan-down'];
@@ -139,6 +141,7 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
   const warnings: string[] = [];
   const warn = (m: string) => warnings.push(m);
   let voiceModeSet = false;
+  let clipVolumeSet = false;
 
   const sheet = (names: string[]): Sheet => {
     const name = wb.SheetNames.find((n) => names.map(norm).includes(norm(n)));
@@ -168,8 +171,11 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     settings.musicFile = asStr(get(['MusicFile', 'Music File', 'Music']));
     settings.musicStartOffset = asNum(get(['MusicStartOffset', 'Music Start Offset', 'MusicOffset']), settings.musicStartOffset);
     settings.musicVolume = asNum(get(['MusicVolume', 'Music Volume']), settings.musicVolume);
+    clipVolumeSet = asStr(get(['ClipVolume', 'Clip Volume'])) !== '';
     settings.clipVolume = asNum(get(['ClipVolume', 'Clip Volume']), settings.clipVolume);
     settings.voiceVolume = asNum(get(['VoiceVolume', 'Voice Volume']), settings.voiceVolume);
+    const fillStr = norm(asStr(get(['Fill', 'Frame Fill', 'Fit'])));
+    if (fillStr) settings.fill = fillStr === 'fill' || fillStr === 'cover' || fillStr === 'crop' ? 'cover' : 'contain';
     settings.watermarkFile = asStr(get(['WatermarkFile', 'Watermark File', 'Watermark', 'Logo', 'LogoFile']));
     settings.watermarkX = asNum(get(['WatermarkX', 'Watermark X']), settings.watermarkX);
     settings.watermarkY = asNum(get(['WatermarkY', 'Watermark Y']), settings.watermarkY);
@@ -264,6 +270,11 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
   if (!voiceModeSet) {
     settings.voiceMode = voices.some((v) => v.mode === 'range') ? 'ranges' : voices.some((v) => v.mode === 'clip') ? 'per-clip' : 'whole';
   }
+  // With narration and no explicit ClipVolume, mute the clips' own sound so voiceovers aren't muddied by it.
+  if (!clipVolumeSet && voices.length) {
+    settings.clipVolume = 0;
+    warn('Clip audio was muted so the voiceovers stay clear. Add a ClipVolume setting if you want the clips’ own sound.');
+  }
 
   if (!clips.length) warn('No clips were found. Add rows to the "Videos" sheet with at least a File for each.');
   return { settings, clips, pills, images, voices, warnings };
@@ -301,11 +312,18 @@ export async function sampleWorkbookBlob(): Promise<Blob> {
     [''],
     ['Leave anything blank to use a sensible default (square 960x960 output, 3s logo, dissolve between clips).'],
     [''],
+    ['TIPS for a clean result:'],
+    ['  - Fill: in Settings use Fill = fill so non-square clips crop to fill the frame instead of showing black bars.'],
+    ['  - Voiceovers: when you use them, the clips’ own sound is muted automatically so voices stay clear.'],
+    ['  - To stop two voices overlapping where clips cross-fade, add a Transition column to the Videos sheet and set it to: cut'],
+    ['  - Captions sit centre-bottom by default. For exact placement/size/timing, use the optional Pills sheet below.'],
+    [''],
     ['OPTIONAL — only if you want more control, add any of these extra sheets (all optional):'],
-    ['  Settings   : OutputSize (e.g. 1024x1024), MusicFile, WatermarkFile, and more.'],
-    ['  Pills      : full caption control — Clip, Text, X, Y, Size, Start, End, colours, Font.'],
-    ['  Images     : overlay pictures — Clip, File, X, Y, Size.'],
+    ['  Settings   : OutputSize (e.g. 1024x1024), Fill, ClipVolume, MusicFile, WatermarkFile, and more.'],
+    ['  Pills      : full caption control — Clip, Text, X, Y (%), Size (%), Start, End (seconds), colours, Font.'],
+    ['  Images     : overlay pictures / your own text-pill PNGs — Clip, File, X, Y, Size (%).'],
     ['  Voiceovers : one voice across several clips — Mode=range, FromClip, ToClip, File.'],
+    ['You can also add TrimStart / TrimEnd / Transition / Motion columns to the Videos sheet per clip.'],
     ['Column names are not case-sensitive, and spaces are ignored.'],
   ];
   const insSheet = XLSX.utils.aoa_to_sheet(instructions);
@@ -316,6 +334,8 @@ export async function sampleWorkbookBlob(): Promise<Blob> {
   const settings = [
     ['Setting', 'Value', 'Notes'],
     ['OutputSize', '1024x1024', '960x960, 1024x1024, or any WIDTHxHEIGHT'],
+    ['Fill', 'fill', 'fill = crop clips to fill the frame (no black bars); fit = letterbox (keep whole frame)'],
+    ['ClipVolume', '', 'volume of the clips’ own sound, 0–100 (left blank = muted automatically when voiceovers are used)'],
     ['MusicFile', '', 'background music file name (optional)'],
     ['WatermarkFile', '', 'logo shown on every clip (optional)'],
     ['WatermarkX', 84, 'logo position across, % (0 left … 100 right)'],

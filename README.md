@@ -30,7 +30,8 @@ Browser (Chrome / Edge / Safari)
 | Stateless soft limiter on the mix | Loud layers can never clip, with no artefacts between chunks |
 | Timeline planned on an exact frame grid (`timeline.ts`) shared by UI and engine | Durations shown in the UI match the export; overlapping transitions shorten the video exactly as previewed |
 | Overlapping clips decoded side by side, audio crossfaded with the picture | Dissolve/slide/wipe look and sound seamless |
-| Output size is the ad canvas only — 960×960 (required), 1024×1024 (maximum), or a custom size; clips are letterboxed into the square | Matches the delivery spec; clips of any shape fit the square with black bars (fit: contain) |
+| Output size is the ad canvas only — 960×960 (required), 1024×1024 (maximum), or a custom size; each clip either fits (letterbox) or fills (crop) the square via the `fill` option | Matches the delivery spec; clips of any shape fit the square with black bars (`contain`, default) or crop to fill it edge-to-edge (`cover`), chosen in the Output settings or the Excel `Fill` setting |
+| When Excel voiceovers are present and no ClipVolume is given, the clips' own audio is muted | Narrated ads usually don't want the clips' baked-in sound competing with the voiceover; a ClipVolume setting overrides it |
 | Default very-high bitrate at the clips' own frame rate (no frames skipped) | Best quality; a 30 fps cap is still selectable for a smaller/faster file |
 | Export streamed to the Origin Private File System, with the MP4 index reserved up front (`fastStart: 'reserve'`) | Output size is limited by free disk space, not RAM; files stay fast-start; falls back to in-memory where OPFS is unavailable |
 | Input videos read lazily from disk (`BlobSource`); photos and overlay images decoded only while their clip is on screen | Memory stays flat no matter how large or how many the inputs are |

@@ -708,6 +708,7 @@ export default function App() {
   const [preset, setPreset] = useState(SIZE_OPTIONS[0]);
   const [custom, setCustom] = useState<Size>({ width: 1024, height: 1024 });
   const [quality, setQuality] = useState<Quality>('very-high');
+  const [fill, setFill] = useState<'contain' | 'cover'>('contain');
   const [logoSeconds, setLogoSeconds] = useState(3);
   // Default to matching the clips' frame rate — no frames are skipped, so motion stays at full quality.
   const [fastFps, setFastFps] = useState(false);
@@ -1007,6 +1008,7 @@ export default function App() {
         logoSeconds,
         transitionSeconds,
         quality,
+        fill,
         logoOverlay: logoOverlay?.status === 'ready' ? { file: logoOverlay.file, x: logoOverlay.x, y: logoOverlay.y, scale: logoOverlay.scale } : undefined,
         clipVolume: clipVolume / 100,
         voiceVolume: voiceVolume / 100,
@@ -1202,6 +1204,7 @@ export default function App() {
       setDownloadCodec(bp.settings.downloadCodec);
       setDownloadMB(bp.settings.targetSizeMB >= 4 ? 5 : 2);
       setVoiceMode(bp.settings.voiceMode);
+      setFill(bp.settings.fill);
 
       // Watermark logo.
       if (bp.settings.watermarkFile) {
@@ -1318,6 +1321,7 @@ export default function App() {
     setMusic(null);
     setH264({ status: 'idle' });
     setJob({ state: 'idle' });
+    setFill('contain');
     setIngestWarnings([]);
     setExcelFile(null);
     setExcelMedia([]);
@@ -1947,6 +1951,13 @@ export default function App() {
                 Exports at {outputSize.width}×{outputSize.height}
                 {preset === CUSTOM_PRESET && ` · ${CUSTOM_SIZE_LIMITS.min}–${CUSTOM_SIZE_LIMITS.max} px, even numbers`}
               </span>
+            </label>
+            <label>
+              Frame fill
+              <select value={fill} disabled={busy} onChange={(e) => setFill(e.target.value as 'contain' | 'cover')}>
+                <option value="contain">Fit — show the whole clip (black bars)</option>
+                <option value="cover">Fill — crop clips to fill the frame</option>
+              </select>
             </label>
             <label>
               Quality
