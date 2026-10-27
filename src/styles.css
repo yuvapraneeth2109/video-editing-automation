@@ -201,6 +201,11 @@ button.link:disabled { opacity: 0.5; }
 .dropzone.small { min-height: 110px; gap: 6px; }
 .intake-actions { display: flex; gap: 14px; align-items: center; }
 .warn-list { margin: 6px 0; padding-left: 18px; font-size: 13px; }
+.file-chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.file-chips .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; padding: 4px 6px 4px 10px; font-size: 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+.file-chips .chip span, .file-chips .chip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-chips .chip button { flex: 0 0 auto; width: 18px; height: 18px; padding: 0; border: none; border-radius: 50%; background: var(--border); color: var(--text); cursor: pointer; line-height: 1; }
+.file-chips .chip button:hover { background: var(--blue); color: #fff; }
 @media (max-width: 560px) { .chooser-grid, .intake-grid { grid-template-columns: 1fr; } }
 /* Smaller-file download options (codec + target size). */
 .download-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 4px 0 12px; }

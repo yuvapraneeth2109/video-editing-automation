@@ -692,6 +692,7 @@ export default function App() {
   const [excelFile, setExcelFile] = useState<File | null>(null);
   const [excelMedia, setExcelMedia] = useState<File[]>([]);
   const [excelStatus, setExcelStatus] = useState<{ state: 'idle' | 'building' | 'error'; message?: string }>({ state: 'idle' });
+  const [excelDragging, setExcelDragging] = useState(false);
   const [ingestWarnings, setIngestWarnings] = useState<string[]>([]);
   const [logoOverlay, setLogoOverlay] = useState<Overlay | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
@@ -1089,6 +1090,18 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
   };
 
+  /** Adds media files to the Excel intake, accumulating across selections/folders and de-duplicating by name+size. */
+  const addExcelMedia = (files: File[]) => {
+    if (!files.length) return;
+    setExcelStatus({ state: 'idle' });
+    setExcelMedia((prev) => {
+      const map = new Map(prev.map((f) => [`${f.name}:${f.size}`, f]));
+      for (const f of files) map.set(`${f.name}:${f.size}`, f);
+      return [...map.values()];
+    });
+  };
+  const removeExcelMedia = (key: string) => setExcelMedia((prev) => prev.filter((f) => `${f.name}:${f.size}` !== key));
+
   /** Reads the uploaded Excel + media and builds a complete project, then lands in the editor ready to export. */
   const buildFromExcel = async () => {
     if (!excelFile || !excelMedia.length || excelStatus.state === 'building') return;
@@ -1362,21 +1375,44 @@ export default function App() {
               <strong>1 · Excel blueprint</strong>
               <span className="muted">{excelFile ? excelFile.name : '.xlsx or .csv — clips, pills, voiceovers, settings'}</span>
             </label>
-            <label className="dropzone small">
+            <label
+              className={`dropzone small${excelDragging ? ' active' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setExcelDragging(true);
+              }}
+              onDragLeave={() => setExcelDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setExcelDragging(false);
+                addExcelMedia(Array.from(e.dataTransfer.files ?? []));
+              }}
+            >
               <input
                 type="file"
                 multiple
                 hidden
                 onChange={(e) => {
-                  setExcelMedia(Array.from(e.target.files ?? []));
-                  setExcelStatus({ state: 'idle' });
+                  addExcelMedia(Array.from(e.target.files ?? []));
                   e.target.value = '';
                 }}
               />
-              <strong>2 · All media files</strong>
-              <span className="muted">{excelMedia.length ? `${excelMedia.length} file${excelMedia.length > 1 ? 's' : ''} selected` : 'videos, photos, audio, logo — select them all'}</span>
+              <strong>2 · Add media files</strong>
+              <span className="muted">Videos, photos, audio, logo — add from any folder, as many times as you like (or drag them here)</span>
             </label>
           </div>
+          {excelMedia.length > 0 && (
+            <div className="file-chips">
+              <span className="muted">{excelMedia.length} file{excelMedia.length > 1 ? 's' : ''} added:</span>
+              {excelMedia.map((f) => (
+                <span key={`${f.name}:${f.size}`} className="chip" title={f.name}>
+                  {f.name}
+                  <button type="button" aria-label={`Remove ${f.name}`} onClick={() => removeExcelMedia(`${f.name}:${f.size}`)}>✕</button>
+                </span>
+              ))}
+              <button type="button" className="link" onClick={() => setExcelMedia([])}>Clear all</button>
+            </div>
+          )}
           <div className="intake-actions">
             <button className="link" onClick={downloadSample}>⬇ Download sample Excel template</button>
           </div>

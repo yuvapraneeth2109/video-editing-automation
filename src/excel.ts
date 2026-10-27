@@ -138,6 +138,7 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
   }
   const warnings: string[] = [];
   const warn = (m: string) => warnings.push(m);
+  let voiceModeSet = false;
 
   const sheet = (names: string[]): Sheet => {
     const name = wb.SheetNames.find((n) => names.map(norm).includes(norm(n)));
@@ -161,6 +162,7 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     settings.transition = oneOf(get(['Transition']), TRANSITIONS, settings.transition, warn, 'Transition');
     settings.transitionSeconds = asNum(get(['TransitionSeconds', 'Transition Seconds']), settings.transitionSeconds);
     settings.frameRate = (norm(asStr(get(['FrameRate', 'Frame Rate']), settings.frameRate)) === 'fast' ? 'fast' : 'smooth');
+    voiceModeSet = asStr(get(['VoiceMode', 'Voice Mode'])) !== '';
     const vm = norm(asStr(get(['VoiceMode', 'Voice Mode']), settings.voiceMode));
     settings.voiceMode = vm === 'perclip' || vm === 'per-clip' ? 'per-clip' : vm === 'ranges' || vm === 'range' ? 'ranges' : 'whole';
     settings.musicFile = asStr(get(['MusicFile', 'Music File', 'Music']));
@@ -176,27 +178,38 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     settings.targetSizeMB = asNum(get(['TargetSizeMB', 'Target Size MB', 'TargetMB']), settings.targetSizeMB);
   }
 
-  // Clips sheet.
   const clips: BpClip[] = [];
-  sheet(['Clips', 'Clip', 'Videos']).forEach((row, i) => {
+  const pills: BpPill[] = [];
+  const images: BpImage[] = [];
+  const voices: BpVoice[] = [];
+
+  // Main sheet — "Videos" (or "Clips"): one row per clip. A simple file can stop here: Order, File, Seconds,
+  // Caption and Voiceover are enough. The Caption and Voiceover cells are shortcuts that fill the Pills and
+  // Voiceovers lists automatically, so most people never need the advanced sheets.
+  sheet(['Videos', 'Clips', 'Clip']).forEach((row, i) => {
     const file = asStr(field(row, ['File', 'FileName', 'Video', 'Clip']));
     if (!file) return;
+    const order = asNum(field(row, ['Order', 'No', '#', 'Index']), i + 1);
     clips.push({
-      order: asNum(field(row, ['Order', 'No', '#', 'Index']), i + 1),
+      order,
       file,
-      photoSeconds: asOpt(field(row, ['PhotoSeconds', 'Photo Seconds', 'Seconds', 'Duration'])),
+      photoSeconds: asOpt(field(row, ['Seconds', 'PhotoSeconds', 'Photo Seconds', 'Duration'])),
       trimStart: asOpt(field(row, ['TrimStart', 'Trim Start', 'Start'])),
       trimEnd: asOpt(field(row, ['TrimEnd', 'Trim End', 'End'])),
       motion: oneOf(field(row, ['Motion']), MOTIONS, 'none', warn, 'Motion'),
       motionSpeed: oneOf(field(row, ['MotionSpeed', 'Motion Speed', 'Speed']), SPEEDS, 'medium', warn, 'MotionSpeed'),
       transition: asStr(field(row, ['Transition', 'TransitionToNext'])) ? oneOf(field(row, ['Transition', 'TransitionToNext']), TRANSITIONS, settings.transition, warn, 'Transition') : undefined,
     });
+    // Inline shortcuts.
+    const caption = asStr(field(row, ['Caption', 'Text', 'Pill']));
+    if (caption) pills.push({ clip: order, text: caption, x: 50, y: 85, size: 100, start: 0, end: 0, background: '#0f1115', opacity: 72, textColor: '#ffffff', font: 'system' });
+    const vo = asStr(field(row, ['Voiceover', 'Voice', 'Narration', 'VO']));
+    if (vo) voices.push({ mode: 'clip', clip: order, file: vo, trimStart: 0, trimEnd: 0, startOffset: 0 });
   });
   clips.sort((a, b) => a.order - b.order);
 
-  // Pills sheet.
-  const pills: BpPill[] = [];
-  sheet(['Pills', 'Pill', 'Captions', 'Text']).forEach((row) => {
+  // Optional "Pills" sheet for full caption control (placement, size, timing, colours).
+  sheet(['Pills', 'Captions']).forEach((row) => {
     const text = asStr(field(row, ['Text', 'Caption', 'Pill']));
     const clip = asNum(field(row, ['Clip', 'ClipOrder', 'Clip Order', 'Video', 'Order']), 0);
     if (!text || !clip) return;
@@ -215,8 +228,7 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     });
   });
 
-  // Images sheet.
-  const images: BpImage[] = [];
+  // Optional "Images" sheet for overlay pictures on a clip.
   sheet(['Images', 'Image', 'Pictures', 'Overlays']).forEach((row) => {
     const file = asStr(field(row, ['File', 'FileName', 'Image', 'Picture']));
     const clip = asNum(field(row, ['Clip', 'ClipOrder', 'Clip Order', 'Video', 'Order']), 0);
@@ -230,12 +242,11 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     });
   });
 
-  // Voiceovers sheet.
-  const voices: BpVoice[] = [];
-  sheet(['Voiceovers', 'Voiceover', 'Voice', 'Narration']).forEach((row) => {
+  // Optional "Voiceovers" sheet for whole-video or multi-clip (range) narration.
+  sheet(['Voiceovers', 'Voiceover', 'Narration']).forEach((row) => {
     const file = asStr(field(row, ['File', 'FileName', 'Voiceover', 'Audio']));
     if (!file) return;
-    const m = norm(asStr(field(row, ['Mode', 'Type']), settings.voiceMode));
+    const m = norm(asStr(field(row, ['Mode', 'Type']), 'whole'));
     const mode: BpVoice['mode'] = m === 'clip' || m === 'perclip' || m === 'per-clip' ? 'clip' : m === 'range' || m === 'ranges' ? 'range' : 'whole';
     voices.push({
       mode,
@@ -249,7 +260,12 @@ export async function parseWorkbook(buffer: ArrayBuffer): Promise<Blueprint> {
     });
   });
 
-  if (!clips.length) warn('No clips were found. Add rows to the "Clips" sheet with at least a File for each.');
+  // If the sheet didn't say which voice mode, work it out from the rows: range beats per-clip beats whole.
+  if (!voiceModeSet) {
+    settings.voiceMode = voices.some((v) => v.mode === 'range') ? 'ranges' : voices.some((v) => v.mode === 'clip') ? 'per-clip' : 'whole';
+  }
+
+  if (!clips.length) warn('No clips were found. Add rows to the "Videos" sheet with at least a File for each.');
   return { settings, clips, pills, images, voices, warnings };
 }
 
@@ -258,73 +274,58 @@ export async function sampleWorkbookBlob(): Promise<Blob> {
   const XLSX = await loadXLSX();
   const wb = XLSX.utils.book_new();
 
+  // The whole simple format is ONE sheet. Fill it, upload this file and your media, and you're done.
+  const videos = [
+    ['Order', 'File', 'Seconds', 'Caption', 'Voiceover'],
+    [1, 'clip1.mp4', '', 'Fresh dough, made every morning', 'clip1_voice.mp3'],
+    [2, 'photo1.jpg', 4, 'Since 1998', ''],
+    [3, 'clip2.mp4', '', 'Order online today', 'clip2_voice.mp3'],
+  ];
+  const videosSheet = XLSX.utils.aoa_to_sheet(videos);
+  videosSheet['!cols'] = [{ wch: 7 }, { wch: 18 }, { wch: 9 }, { wch: 34 }, { wch: 18 }];
+  XLSX.utils.book_append_sheet(wb, videosSheet, 'Videos');
+
   const instructions = [
-    ['Roothoot Video Editor — automation template'],
+    ['Roothoot Video Editor — template'],
     [''],
-    ['Fill in the sheets below, then in the app choose "Add Excel and files", upload this file in the first box'],
-    ['and ALL your media (videos, photos, audio, logo) in the second box. File names here must match exactly.'],
+    ['THE SIMPLE WAY (just the "Videos" sheet):'],
+    ['  Order     : play order (1, 2, 3 …)'],
+    ['  File      : the video or photo file name (must match a file you upload)'],
+    ['  Seconds   : for PHOTOS only — how long to show it (leave blank for videos)'],
+    ['  Caption   : optional text shown near the bottom of that clip (leave blank for none)'],
+    ['  Voiceover : optional narration file that plays over that clip (leave blank for none)'],
     [''],
-    ['Clips sheet    : one row per video/photo, in play order (Order). Photos use PhotoSeconds. Videos can set TrimStart/TrimEnd.'],
-    ['Pills sheet    : one row per caption. Clip = the clip Order it sits on. X/Y/Size are %. Start/End are seconds into the clip (End 0 = until the clip ends).'],
-    ['Images sheet   : one row per overlay picture. Clip = clip Order. X/Y/Size are %.'],
-    ['Voiceovers     : Mode = whole (one file for the video), clip (Clip = order), or range (FromClip..ToClip). TrimStart/TrimEnd cut the audio; StartOffset delays it (seconds).'],
-    ['Settings sheet : OutputSize like 960x960 or 1024x1024 or 1080x1350. Watermark = your logo file + position %. Music optional.'],
+    ['Then in the app: choose "Add Excel and files", upload this file, and add all your media'],
+    ['(videos, photos, voiceover audio, music, logo). You can add files from different folders and'],
+    ['add more at any time. Press "Build the video" and everything is filled in for you.'],
     [''],
-    ['Anything left blank uses a sensible default. Motion: none, zoom-in, zoom-out, zoom-in-out, pan-left, pan-right, pan-up, pan-down.'],
-    ['Transition: cut, dissolve, fade, slide, wipe. Font: system, helvetica, verdana, trebuchet, georgia, times, courier, impact. Codec: auto, av1, hevc, avc.'],
+    ['Leave anything blank to use a sensible default (square 960x960 output, 3s logo, dissolve between clips).'],
+    [''],
+    ['OPTIONAL — only if you want more control, add any of these extra sheets (all optional):'],
+    ['  Settings   : OutputSize (e.g. 1024x1024), MusicFile, WatermarkFile, and more.'],
+    ['  Pills      : full caption control — Clip, Text, X, Y, Size, Start, End, colours, Font.'],
+    ['  Images     : overlay pictures — Clip, File, X, Y, Size.'],
+    ['  Voiceovers : one voice across several clips — Mode=range, FromClip, ToClip, File.'],
+    ['Column names are not case-sensitive, and spaces are ignored.'],
   ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(instructions), 'Instructions');
+  const insSheet = XLSX.utils.aoa_to_sheet(instructions);
+  insSheet['!cols'] = [{ wch: 95 }];
+  XLSX.utils.book_append_sheet(wb, insSheet, 'Instructions');
 
-  const clips = [
-    ['Order', 'File', 'PhotoSeconds', 'TrimStart', 'TrimEnd', 'Motion', 'MotionSpeed', 'Transition'],
-    [1, 'clip1.mp4', '', 0, 6, 'zoom-in', 'medium', 'dissolve'],
-    [2, 'photo1.jpg', 4, '', '', 'pan-left', 'slow', 'dissolve'],
-    [3, 'clip2.mp4', '', 1.5, 10, 'none', 'medium', 'cut'],
-  ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(clips), 'Clips');
-
-  const pills = [
-    ['Clip', 'Text', 'X', 'Y', 'Size', 'Start', 'End', 'Background', 'Opacity', 'TextColor', 'Font'],
-    [1, 'Fresh dough, made every morning', 50, 85, 100, 0, 0, '#0f1115', 72, '#ffffff', 'system'],
-    [1, 'Since 1998', 50, 15, 80, 2, 5, '#0f1115', 60, '#ffd54a', 'impact'],
-    [3, 'Order online today', 50, 85, 120, 1, 0, '#0f1115', 72, '#ffffff', 'helvetica'],
-  ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(pills), 'Pills');
-
-  const images = [
-    ['Clip', 'File', 'X', 'Y', 'Size'],
-    [2, 'badge.png', 80, 20, 22],
-  ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(images), 'Images');
-
-  const voices = [
-    ['Mode', 'Clip', 'FromClip', 'ToClip', 'File', 'TrimStart', 'TrimEnd', 'StartOffset'],
-    ['range', '', 1, 2, 'intro_vo.mp3', 0, 0, 0],
-    ['clip', 3, '', '', 'clip3_vo.mp3', 0.5, 0, 0.5],
-  ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(voices), 'Voiceovers');
-
+  // A small, commented Settings sheet people can edit or delete entirely.
   const settings = [
-    ['Setting', 'Value'],
-    ['OutputSize', '1024x1024'],
-    ['LogoSeconds', 3],
-    ['Transition', 'dissolve'],
-    ['TransitionSeconds', 0.75],
-    ['FrameRate', 'smooth'],
-    ['VoiceMode', 'range'],
-    ['MusicFile', 'music.mp3'],
-    ['MusicStartOffset', 0],
-    ['MusicVolume', 20],
-    ['ClipVolume', 100],
-    ['VoiceVolume', 100],
-    ['WatermarkFile', 'logo.png'],
-    ['WatermarkX', 84],
-    ['WatermarkY', 14],
-    ['WatermarkSize', 18],
-    ['DownloadCodec', 'auto'],
-    ['TargetSizeMB', 5],
+    ['Setting', 'Value', 'Notes'],
+    ['OutputSize', '1024x1024', '960x960, 1024x1024, or any WIDTHxHEIGHT'],
+    ['MusicFile', '', 'background music file name (optional)'],
+    ['WatermarkFile', '', 'logo shown on every clip (optional)'],
+    ['WatermarkX', 84, 'logo position across, % (0 left … 100 right)'],
+    ['WatermarkY', 14, 'logo position down, % (0 top … 100 bottom)'],
+    ['WatermarkSize', 18, 'logo width, % of the frame'],
+    ['TargetSizeMB', 5, 'smaller-file download budget: 2 (mobile) or 5 (desktop)'],
   ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(settings), 'Settings');
+  const setSheet = XLSX.utils.aoa_to_sheet(settings);
+  setSheet['!cols'] = [{ wch: 16 }, { wch: 12 }, { wch: 46 }];
+  XLSX.utils.book_append_sheet(wb, setSheet, 'Settings');
 
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
   return new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
