@@ -694,6 +694,9 @@ export default function App() {
   const [excelStatus, setExcelStatus] = useState<{ state: 'idle' | 'building' | 'error'; message?: string }>({ state: 'idle' });
   const [excelDragging, setExcelDragging] = useState(false);
   const [ingestWarnings, setIngestWarnings] = useState<string[]>([]);
+  // True once a project was built from an Excel blueprint: the voiceover add/trim controls are then hidden,
+  // because the voiceovers are defined by the spreadsheet.
+  const [fromExcel, setFromExcel] = useState(false);
   const [logoOverlay, setLogoOverlay] = useState<Overlay | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>('whole');
   const [voiceover, setVoiceover] = useState<AudioTrack | null>(null);
@@ -746,7 +749,12 @@ export default function App() {
   const canExport =
     SUPPORTED && !busy && clips.length > 0 && ready.length === clips.length && !audioPending && !logoPending && !overlays.some((o) => o?.status === 'loading');
   const fps = ready.length ? autoFps(ready.map((c) => c.info), fastFps) : 30;
-  const plan = planTimeline(ready.map(clipPlaySeconds), ready.map((c) => c.transition), fps, logoSeconds, transitionSeconds);
+  // A per-clip voiceover makes its clip wait: the clip's on-screen time is the longer of its own length and
+  // the voiceover's (offset + duration), so the voice always plays in full and the clip always plays in full.
+  const clipVoiceSeconds = (c: Clip & { status: 'ready' }) =>
+    voiceMode === 'per-clip' && c.voiceover?.status === 'ready' ? (c.voiceOffset || 0) + c.voiceover.buffer.duration : 0;
+  const effectiveSeconds = (c: Clip & { status: 'ready' }) => Math.max(clipPlaySeconds(c), clipVoiceSeconds(c));
+  const plan = planTimeline(ready.map(effectiveSeconds), ready.map((c) => c.transition), fps, logoSeconds, transitionSeconds);
   const totalSeconds = ready.length ? plan.totalFrames / fps : 0;
   const voiceOverflow =
     voiceMode === 'whole' && voiceover?.status === 'ready' && ready.length
@@ -975,7 +983,7 @@ export default function App() {
       const result = await renderVideo({
         clips: ready.map((c) => ({
           file: c.file,
-          info: { ...c.info, duration: clipPlaySeconds(c) },
+          info: { ...c.info, duration: effectiveSeconds(c) },
           photo: c.photo,
           motion: c.motion,
           motionSpeed: c.motionSpeed,
@@ -1140,6 +1148,8 @@ export default function App() {
       clips.forEach(freeClip);
       if (logoOverlay) URL.revokeObjectURL(logoOverlay.url);
 
+      // With per-clip narration, default to hard cuts so two clips' voiceovers never overlap at a cross-fade.
+      const defaultTransition: Transition = bp.settings.voiceMode === 'per-clip' && bp.voices.length ? 'cut' : (bp.settings.transition as Transition);
       const orderToId = new Map<number, string>();
       const built: Clip[] = [];
       const pending: { id: string; file: File; photo: boolean; trimStart?: number; trimEnd?: number; photoSeconds?: number }[] = [];
@@ -1182,7 +1192,7 @@ export default function App() {
           motion: bc.motion as Motion,
           motionSpeed: bc.motionSpeed as MotionSpeed,
           trim: { start: 0, end: 0 },
-          transition: (bc.transition ?? bp.settings.transition) as Transition,
+          transition: (bc.transition as Transition) ?? defaultTransition,
         } as Clip);
         pending.push({ id, file, photo, trimStart: bc.trimStart, trimEnd: bc.trimEnd, photoSeconds: bc.photoSeconds });
       }
@@ -1279,6 +1289,7 @@ export default function App() {
       setClips(built);
       setJob({ state: 'idle' });
       setIngestWarnings(bp.warnings);
+      setFromExcel(true);
       setMode('manual');
       setExcelStatus({ state: 'idle' });
 
@@ -1322,6 +1333,7 @@ export default function App() {
     setH264({ status: 'idle' });
     setJob({ state: 'idle' });
     setFill('contain');
+    setFromExcel(false);
     setIngestWarnings([]);
     setExcelFile(null);
     setExcelMedia([]);
@@ -1349,7 +1361,7 @@ export default function App() {
               <strong>Add Excel and files</strong>
               <span className="muted">Upload a blueprint spreadsheet and all your media — the video is built automatically, no manual editing.</span>
             </button>
-            <button className="choice" onClick={() => setMode('manual')}>
+            <button className="choice" onClick={() => { setFromExcel(false); setMode('manual'); }}>
               <strong>Manually edit</strong>
               <span className="muted">Build the video by hand — add clips, trims, captions, voiceovers and settings yourself.</span>
             </button>
@@ -1498,9 +1510,7 @@ export default function App() {
             </li>
             {clips.map((clip, i) => {
               const clipVoice = clip.voiceover?.status === 'ready' ? clip.voiceover : null;
-              const voiceSeconds = clipVoice ? clipVoice.buffer.duration : 0;
               const playSeconds = clip.status === 'ready' ? clipPlaySeconds(clip) : 0;
-              const overflow = perClip && clip.status === 'ready' && voiceSeconds ? voiceSeconds - playSeconds : 0;
               return (
                 <li key={clip.id} className={`clip ${clip.status}`}>
                   <div className="clip-row">
@@ -1573,7 +1583,14 @@ export default function App() {
 
                       {!clip.photo && <TrimControl clip={clip} disabled={busy} onChange={(patch) => updateTrim(clip, patch)} />}
 
-                      {perClip && (
+                      {perClip && fromExcel && (
+                        clipVoice ? (
+                          <p className="hint muted">Voiceover: {clipVoice.file.name} — this clip waits for it to finish playing.</p>
+                        ) : (
+                          <p className="hint muted">No voiceover on this clip.</p>
+                        )
+                      )}
+                      {perClip && !fromExcel && (
                         <>
                           <AudioPicker label="Voiceover" track={clip.voiceover} disabled={busy} preview={false} onFile={(file) => addVoiceover(file, clip.id)} onRemove={() => update(clip.id, { voiceover: null, voiceOffset: 0, voiceTrim: { start: 0, end: 0 } })} />
                           {clipVoice && (
@@ -1582,18 +1599,8 @@ export default function App() {
                               <StartOffset value={clip.voiceOffset} max={Math.max(1, playSeconds)} disabled={busy} onChange={(v) => update(clip.id, { voiceOffset: v })} />
                             </>
                           )}
-                          {overflow > 0.5 && (
-                            <p className="hint warn">
-                              This voiceover is {formatTime(overflow)} longer than the clip and will be cut at the end.
-                              {clip.photo && (
-                                <>
-                                  {' '}
-                                  <button className="link" disabled={busy} onClick={() => setPhotoSeconds(clip, Math.ceil(voiceSeconds * 2) / 2)}>
-                                    Show the photo for the whole voiceover
-                                  </button>
-                                </>
-                              )}
-                            </p>
+                          {clipVoice && clipVoice.buffer.duration > playSeconds + 0.3 && (
+                            <p className="hint muted">This clip will hold its last frame until the voiceover finishes ({formatTime(clipVoice.buffer.duration)}).</p>
                           )}
                         </>
                       )}
@@ -1777,11 +1784,17 @@ export default function App() {
               <div className="slot-head">
                 <strong>Voiceover</strong>
                 <span className="muted">
-                  {perClip ? 'Add a file to each clip above' : voiceMode === 'ranges' ? 'Add files that each cover a run of clips' : 'Starts with the first clip'}
+                  {fromExcel ? 'Set from your Excel' : perClip ? 'Add a file to each clip above' : voiceMode === 'ranges' ? 'Add files that each cover a run of clips' : 'Starts with the first clip'}
                 </span>
               </div>
 
-              {voiceMode === 'whole' && (
+              {fromExcel && (
+                <p className="hint muted">
+                  Voiceovers come from your Excel and play in full — each clip waits for its voiceover. Re-upload the Excel to change them. You can still adjust the volume below.
+                </p>
+              )}
+
+              {voiceMode === 'whole' && !fromExcel && (
                 <>
                   <AudioPicker label="Voiceover" track={voiceover} disabled={busy} preview={false} onFile={(file) => addVoiceover(file)} onRemove={() => setVoiceover(null)} />
                   {wholeVoiceTrack && (
@@ -1794,7 +1807,7 @@ export default function App() {
                 </>
               )}
 
-              {voiceMode === 'ranges' && (
+              {voiceMode === 'ranges' && !fromExcel && (
                 <div className="ranges">
                   {ranges.map((r) => {
                     const buffer = readyBuffer(r.track);

@@ -877,10 +877,16 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         for (let i = 0; i < frames; i++) yield from + i / fps;
       })(),
     );
+    // When a clip's segment is longer than the source (e.g. it waits for a longer voiceover), hold the last frame.
+    let last: CanvasImageSource | null = null;
     return {
       next: async () => {
         const next = await canvases.next();
-        return !next.done && next.value ? next.value.canvas : null;
+        if (!next.done && next.value) {
+          last = next.value.canvas;
+          return last;
+        }
+        return last;
       },
       close: () => {
         void canvases.return();
