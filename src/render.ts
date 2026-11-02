@@ -611,23 +611,27 @@ const createCallout = (ctx: OffscreenCanvasRenderingContext2D, callout: Callout,
       const s = Math.sin(ang);
       const halfW = textW / 2 + fontSize * 0.4;
       const halfH = textH / 2 + fontSize * 0.3;
-      // Start the line at the edge of the text box so it doesn't cross the text.
-      const edge = Math.min(halfW / (Math.abs(c) || 1e-6), halfH / (Math.abs(s) || 1e-6));
+      // Start the line at the edge of the text box PLUS a small gap, so it never touches the text.
+      const edge = Math.min(halfW / (Math.abs(c) || 1e-6), halfH / (Math.abs(s) || 1e-6)) + fontSize * 0.3;
       const sx = cx + c * edge;
       const sy = cy + s * edge;
-      ctx.strokeStyle = halo;
-      ctx.lineWidth = Math.max(3, fontSize * 0.15);
-      ctx.beginPath();
-      ctx.moveTo(sx, sy);
-      ctx.lineTo(tX, tY);
-      ctx.stroke();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = Math.max(2, fontSize * 0.08);
-      ctx.beginPath();
-      ctx.moveTo(sx, sy);
-      ctx.lineTo(tX, tY);
-      ctx.stroke();
+      const dist = Math.hypot(tX - cx, tY - cy);
       const r = Math.max(3, fontSize * 0.13);
+      // Only draw the line when the dot is clear of the text.
+      if (dist > edge + r) {
+        ctx.strokeStyle = halo;
+        ctx.lineWidth = Math.max(3, fontSize * 0.15);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(tX, tY);
+        ctx.stroke();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(2, fontSize * 0.08);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(tX, tY);
+        ctx.stroke();
+      }
       ctx.fillStyle = halo;
       ctx.beginPath();
       ctx.arc(tX, tY, r + Math.max(1, fontSize * 0.06), 0, Math.PI * 2);

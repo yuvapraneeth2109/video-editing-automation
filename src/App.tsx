@@ -639,6 +639,26 @@ function CalloutEditor({
   };
   const has = callout.text.trim().length > 0;
   const lineW = Math.max(0.5, (callout.size / 100) * 0.7);
+  // Start the leader line at the EDGE of the text (with a small gap) so it never runs into the words.
+  // Coordinates are in the 0–100 viewBox; the font size in those units ≈ 4.2 × the size scale (cqmin on a square).
+  const sizeScale = Math.min(4, Math.max(0.3, callout.size / 100));
+  const fontU = 4.2 * sizeScale;
+  const label = (callout.text || 'Label').trim() || 'Label';
+  const halfW = label.length * fontU * 0.3 + fontU * 0.45;
+  const halfH = fontU * 0.6 + fontU * 0.35;
+  const vx = callout.x * 100;
+  const vy = callout.y * 100;
+  const vtx = callout.tx * 100;
+  const vty = callout.ty * 100;
+  const ang = Math.atan2(vty - vy, vtx - vx);
+  const cos = Math.cos(ang);
+  const sin = Math.sin(ang);
+  const edge = Math.min(halfW / (Math.abs(cos) || 1e-6), halfH / (Math.abs(sin) || 1e-6)) + fontU * 0.3;
+  const lineStartX = vx + cos * edge;
+  const lineStartY = vy + sin * edge;
+  const targetDist = Math.hypot(vtx - vx, vty - vy);
+  // Only draw the line when the dot is clear of the text box.
+  const showLine = callout.pointer && targetDist > edge + 2;
   return (
     <div className="pill-item">
       <div className="pill-head">
@@ -665,10 +685,9 @@ function CalloutEditor({
               onPointerUp={() => setActive(null)}
               onPointerCancel={() => setActive(null)}
             >
-              {callout.pointer && (
+              {showLine && (
                 <svg className="callout-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-                  <line x1={callout.x * 100} y1={callout.y * 100} x2={callout.tx * 100} y2={callout.ty * 100} stroke={callout.color} strokeWidth={lineW} strokeLinecap="round" />
-                  <circle cx={callout.tx * 100} cy={callout.ty * 100} r={Math.max(1, lineW * 1.6)} fill={callout.color} />
+                  <line x1={lineStartX} y1={lineStartY} x2={vtx} y2={vty} stroke={callout.color} strokeWidth={lineW} strokeLinecap="round" />
                 </svg>
               )}
               <span
