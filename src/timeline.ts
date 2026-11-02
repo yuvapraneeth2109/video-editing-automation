@@ -109,15 +109,15 @@ export function customSize(width: number, height: number): Size {
 /** The optional "smaller file" download is kept under this many bytes (default budget). */
 export const H264_MAX_BYTES = 5 * 1024 * 1024;
 
-/** Which codec the smaller-file download uses. `auto` picks the most efficient one the browser can encode. */
-export type DownloadCodec = 'auto' | 'av1' | 'hevc' | 'avc';
+/** Which codec the smaller-file download uses. H.264 ('avc') is the universal default; the others are smaller but need a modern player. */
+export type DownloadCodec = 'avc' | 'hevc' | 'av1' | 'auto';
 
-/** Dropdown labels for the download codec choice. */
+/** Dropdown labels for the download codec choice. H.264 first, because it plays everywhere with nothing to install. */
 export const DOWNLOAD_CODEC_LABELS: Record<DownloadCodec, string> = {
-  auto: 'Auto — smallest your browser can make',
-  av1: 'AV1 — smallest, newest',
-  hevc: 'HEVC / H.265 — small, widely supported',
-  avc: 'H.264 — most compatible',
+  avc: 'H.264 — plays on any phone/laptop (recommended)',
+  hevc: 'HEVC / H.265 — smaller, but needs a modern player',
+  av1: 'AV1 — smallest, but needs the AV1 extension',
+  auto: 'Smallest the browser can make (may not play everywhere)',
 };
 
 /** Short names shown on the finished download. */

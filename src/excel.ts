@@ -91,7 +91,7 @@ const DEFAULT_SETTINGS: BpSettings = {
   watermarkX: 84,
   watermarkY: 14,
   watermarkSize: 18,
-  downloadCodec: 'auto',
+  downloadCodec: 'avc',
   targetSizeMB: 5,
   fill: 'contain',
 };

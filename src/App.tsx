@@ -903,7 +903,7 @@ export default function App() {
   >({ status: 'idle' });
   const h264Abort = useRef<AbortController | null>(null);
   // Smaller-file download settings: which codec, and the size budget (2 MB mobile / 5 MB desktop).
-  const [downloadCodec, setDownloadCodec] = useState<DownloadCodec>('auto');
+  const [downloadCodec, setDownloadCodec] = useState<DownloadCodec>('avc');
   const [downloadMB, setDownloadMB] = useState(5);
 
   const ready = clips.filter((c): c is Clip & { status: 'ready' } => c.status === 'ready');
@@ -944,9 +944,6 @@ export default function App() {
   const aspect = outputSize.width / outputSize.height;
   const firstPreview = ready[0]?.preview ?? null;
 
-  // The smaller-file download keeps the exact size the user chose (never downscaled), so the view is unchanged.
-  const targetBytes = downloadMB * 1024 * 1024;
-  const downloadFits = job.state === 'done' && job.size <= targetBytes;
 
   /** The value shared by every clip, or 'mixed' when clips differ. */
   const common = <K extends 'transition' | 'motion' | 'motionSpeed'>(key: K) =>
@@ -2280,9 +2277,8 @@ export default function App() {
             <button className="secondary" onClick={reset}>Start a new video</button>
           </div>
           <p className="hint muted">
-            <strong>“Download (best quality)” is your {job.outWidth}×{job.outHeight} H.264 file</strong> — exactly as made, plays everywhere. The smaller file keeps the same {job.outWidth}×{job.outHeight} view but squeezes it under {downloadMB} MB using a modern codec (Auto picks AV1 or H.265 when your browser can make them, else H.264), so it looks far cleaner than H.264 at the same size.
-            {downloadFits && (downloadCodec === 'auto' || downloadCodec === 'avc') ? ' This video already fits, so Auto/H.264 copies it with no quality loss — pick AV1 or H.265 to shrink it further.' : ''}
-            {' '}AV1/H.265 play in modern players and phones; use H.264 (or best quality) for the widest compatibility.
+            Both downloads are {job.outWidth}×{job.outHeight}. <strong>“Download (best quality)” and the smaller file both use H.264 by default — they play on any phone, laptop or WhatsApp with nothing to install.</strong> The smaller file squeezes the same view under {downloadMB} MB.
+            {downloadCodec !== 'avc' ? ' ⚠️ You picked AV1/HEVC: those make a smaller file but need a special player/extension (like the AV1 error you saw) — switch the codec back to H.264 for a file that plays everywhere.' : ''}
           </p>
           {h264.status === 'error' && <p className="hint error">{h264.message}</p>}
         </section>
