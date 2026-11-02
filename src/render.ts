@@ -75,6 +75,28 @@ export type TextPill = {
 /** Where and how large an overlay image sits: x/y are its centre (0–1 of the frame), scale its width (0–1). */
 export type ImagePlacement = { x: number; y: number; scale: number };
 
+/**
+ * A callout label: plain text with NO background that explains a feature, optionally with a leader line
+ * pointing at a part of the clip. x/y are the text centre (0–1); tx/ty are the point it points at (0–1).
+ */
+export type Callout = {
+  text: string;
+  x: number;
+  y: number;
+  /** The point the pointer line aims at (0–1 of the frame). */
+  tx: number;
+  ty: number;
+  /** Draw the leader line + dot? If false, only the text is shown. */
+  pointer: boolean;
+  /** Text size as a percentage of the default. */
+  size: number;
+  /** Any CSS colour for the text, line and dot. */
+  color: string;
+  /** When it appears and disappears, in seconds from the start of the clip (end ≤ start or ≥ clip length = until the end). */
+  start: number;
+  end: number;
+};
+
 /** A kept span of an audio file, in seconds. `end` ≤ `start` or ≥ the file length means "to the end". */
 export type AudioTrim = { start: number; end: number };
 
@@ -99,6 +121,8 @@ export type RenderClip = {
   voiceTrim?: AudioTrim;
   /** Any number of captions over this clip, each with its own text, style, size, position and on-screen window. */
   pills: TextPill[];
+  /** Callout labels (no background, optional pointer line), each timed and faded within the clip. */
+  callouts: Callout[];
   /** Images shown over this clip (later ones on top), each at its own position and size. */
   images: ({ file: File } & ImagePlacement)[];
 };
@@ -542,6 +566,90 @@ const createImageOverlay = (
   };
 };
 
+/** Relative luminance of a #rrggbb colour (0 dark … 1 light), to pick a contrasting halo. */
+const hexLuminance = (hex: string) => {
+  const s = hex.replace('#', '');
+  if (s.length < 6) return 1;
+  const r = parseInt(s.slice(0, 2), 16) / 255;
+  const g = parseInt(s.slice(2, 4), 16) / 255;
+  const b = parseInt(s.slice(4, 6), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+
+/**
+ * Lays out a callout once and returns a function that draws it at a given opacity: plain text (no background,
+ * with a contrasting halo so it reads on any clip) and, optionally, a leader line + dot pointing at tx/ty.
+ */
+const createCallout = (ctx: OffscreenCanvasRenderingContext2D, callout: Callout, width: number, height: number) => {
+  const text = callout.text.trim();
+  const color = callout.color || '#ffffff';
+  const base = Math.min(width, height);
+  const sizeScale = Math.min(4, Math.max(0.3, (callout.size || 100) / 100));
+  const fontSize = Math.round(base * 0.04 * sizeScale);
+  const font = `700 ${fontSize}px system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif`;
+  const margin = base * 0.03;
+  // Keep the text on-screen.
+  ctx.font = font;
+  const textW = ctx.measureText(text || ' ').width;
+  const textH = fontSize;
+  const cx = Math.min(width - textW / 2 - margin, Math.max(textW / 2 + margin, clamp01(callout.x) * width));
+  const cy = Math.min(height - textH / 2 - margin, Math.max(textH / 2 + margin, clamp01(callout.y) * height));
+  const halo = hexLuminance(color) > 0.6 ? 'rgba(0, 0, 0, 0.6)' : 'rgba(255, 255, 255, 0.75)';
+
+  return (alpha: number) => {
+    if (alpha <= 0 || !text) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    if (callout.pointer) {
+      const tX = clamp01(callout.tx) * width;
+      const tY = clamp01(callout.ty) * height;
+      const ang = Math.atan2(tY - cy, tX - cx);
+      const c = Math.cos(ang);
+      const s = Math.sin(ang);
+      const halfW = textW / 2 + fontSize * 0.4;
+      const halfH = textH / 2 + fontSize * 0.3;
+      // Start the line at the edge of the text box so it doesn't cross the text.
+      const edge = Math.min(halfW / (Math.abs(c) || 1e-6), halfH / (Math.abs(s) || 1e-6));
+      const sx = cx + c * edge;
+      const sy = cy + s * edge;
+      ctx.strokeStyle = halo;
+      ctx.lineWidth = Math.max(3, fontSize * 0.15);
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(tX, tY);
+      ctx.stroke();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(2, fontSize * 0.08);
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(tX, tY);
+      ctx.stroke();
+      const r = Math.max(3, fontSize * 0.13);
+      ctx.fillStyle = halo;
+      ctx.beginPath();
+      ctx.arc(tX, tY, r + Math.max(1, fontSize * 0.06), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(tX, tY, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.font = font;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = Math.max(2, fontSize * 0.16);
+    ctx.strokeStyle = halo;
+    ctx.strokeText(text, cx, cy);
+    ctx.fillStyle = color;
+    ctx.fillText(text, cx, cy);
+    ctx.restore();
+  };
+};
+
 /** Smooth start and end for transitions and camera moves. */
 const ease = (t: number) => t * t * (3 - 2 * t);
 
@@ -929,6 +1037,18 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
         const fadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor((endFrame - startFrame) / 3)));
         return { draw, startFrame, endFrame, fadeFrames };
       });
+    // Callout labels: same timed, faded window as captions.
+    const callouts = (clip.callouts ?? [])
+      .filter((c) => c.text.trim())
+      .map((c) => {
+        const draw = createCallout(ctx, c, width, height);
+        const startSec = Math.max(0, Math.min(playLen, c.start));
+        const endSec = c.end > startSec && c.end < playLen ? c.end : playLen;
+        const startFrame = Math.round(startSec * fps);
+        const endFrame = Math.max(startFrame + 1, Math.round(endSec * fps));
+        const fadeFrames = Math.max(1, Math.min(Math.round(OVERLAY_FADE * fps), Math.floor((endFrame - startFrame) / 3)));
+        return { draw, startFrame, endFrame, fadeFrames };
+      });
     // Overlay images are decoded only while their clip is on screen, then released.
     const overlays = await Promise.all(
       clip.images.map(async ({ file, x, y, scale }) => ({ bitmap: await decodeImage(file, OVERLAY_MAX_EDGE), place: { x, y, scale } })),
@@ -971,6 +1091,16 @@ async function render(options: RenderOptions, compatible: boolean): Promise<Blob
             pillAlpha = alpha * Math.min(1, fadeIn, fadeOutP);
           }
           pill.draw(pillAlpha);
+        }
+        // Callouts fade in and out at the edges of their own window, then disappear.
+        for (const callout of callouts) {
+          let a = 0;
+          if (k >= callout.startFrame && k < callout.endFrame) {
+            const fadeIn = (k - callout.startFrame + 0.5) / callout.fadeFrames;
+            const fadeOutP = (callout.endFrame - 1 - k + 0.5) / callout.fadeFrames;
+            a = alpha * Math.min(1, fadeIn, fadeOutP);
+          }
+          callout.draw(a);
         }
         ctx.restore();
         k++;

@@ -40,6 +40,9 @@ type PillStyle = { background: string; opacity: number; color: string; font: Pil
 /** One caption. `start`/`end` are its on-screen window in seconds from the clip's start (end 0 = until the clip ends). */
 type Pill = { id: string; text: string; position: PillPosition; start: number; end: number } & PillStyle;
 
+/** A callout label: no-background text + an optional leader line to a target point. x/y text centre, tx/ty target (0–1). */
+type Callout = { id: string; text: string; x: number; y: number; tx: number; ty: number; pointer: boolean; size: number; color: string; start: number; end: number };
+
 /** An image overlay: `url` previews it; x/y are its centre (0–1 of the frame) and scale its width (0–1). */
 type Overlay = { id: string; file: File; url: string; x: number; y: number; scale: number } & (
   | { status: 'loading' }
@@ -61,6 +64,8 @@ type Clip = {
   voiceTrim: Trim;
   /** Captions over this clip — any number, each independently placed, sized and timed. */
   pills: Pill[];
+  /** Callout labels (no background, optional pointer line) over this clip. */
+  callouts: Callout[];
   images: Overlay[];
   motion: Motion;
   motionSpeed: MotionSpeed;
@@ -113,6 +118,8 @@ const DEFAULT_PILL_STYLE: PillStyle = { background: '#0f1115', opacity: 72, colo
 const PILL_SIZE = { min: 40, max: 250, step: 5 };
 /** A fresh caption centred near the bottom, taking the current shared style. */
 const makePill = (style: PillStyle): Pill => ({ id: crypto.randomUUID(), text: '', position: { ...CENTER_BOTTOM }, start: 0, end: 0, ...style });
+/** A fresh callout: white text on the left, pointing at a spot to its right, shown for the whole clip. */
+const makeCallout = (): Callout => ({ id: crypto.randomUUID(), text: '', x: 0.32, y: 0.45, tx: 0.62, ty: 0.5, pointer: true, size: 100, color: '#ffffff', start: 0, end: 0 });
 /** The CSS font-size (in cqmin) for a pill preview, matching the engine's base×0.042×size maths. */
 const pillPreviewFont = (size: number) => `calc(${(4.2 * Math.min(4, Math.max(0.3, size / 100))).toFixed(2)} * 1cqmin)`;
 
@@ -569,6 +576,153 @@ function PillEditor({
   );
 }
 
+/** When a callout appears and how long it stays (then fades out). Stored as start/end; shown as appears-at + duration. */
+function CalloutTiming({ start, end, playLen, disabled, onChange }: { start: number; end: number; playLen: number; disabled: boolean; onChange: (patch: { start?: number; end?: number }) => void }) {
+  const shownEnd = end > start && end < playLen ? end : playLen;
+  const duration = Math.max(0.1, shownEnd - start);
+  const max = Math.max(0.2, playLen);
+  const setStart = (v: number) => onChange({ start: clamp(0, Math.max(0, playLen - 0.2), v) });
+  const setDuration = (d: number) => {
+    const e = start + Math.max(0.1, d);
+    onChange({ end: e >= playLen ? 0 : clamp(start + 0.1, playLen, e) });
+  };
+  return (
+    <div className="pill-timing">
+      <span className="muted">
+        Shows from {formatTime(start)} for {formatTime(duration)}{shownEnd >= playLen ? ' (to the end)' : ''}, then fades out
+      </span>
+      <label className="offset">
+        <span>Appears at</span>
+        <input type="range" min={0} max={max} step={0.1} value={start} disabled={disabled} onChange={(e) => setStart(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0} max={playLen} step={0.1} value={Number(start.toFixed(1))} disabled={disabled} onChange={(e) => setStart(Number(e.target.value) || 0)} />
+        <span className="meta">s</span>
+      </label>
+      <label className="offset">
+        <span>Duration</span>
+        <input type="range" min={0.1} max={max} step={0.1} value={duration} disabled={disabled} onChange={(e) => setDuration(Number(e.target.value))} />
+        <input className="text seconds" type="number" min={0.1} max={playLen} step={0.1} value={Number(duration.toFixed(1))} disabled={disabled} onChange={(e) => setDuration(Number(e.target.value) || 0.1)} />
+        <span className="meta">s</span>
+      </label>
+    </div>
+  );
+}
+
+/** Editor for one callout: drag the text and the target dot over the clip's first frame; colour, size, pointer, timing. */
+function CalloutEditor({
+  callout,
+  index,
+  preview,
+  aspect,
+  playLen,
+  disabled,
+  onChange,
+  onRemove,
+}: {
+  callout: Callout;
+  index: number;
+  preview: string | null;
+  aspect: number;
+  playLen: number;
+  disabled: boolean;
+  onChange: (patch: Partial<Callout>) => void;
+  onRemove: () => void;
+}) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [active, setActive] = useState<null | 'text' | 'target'>(null);
+  const moveTo = (clientX: number, clientY: number) => {
+    const r = frameRef.current?.getBoundingClientRect();
+    if (!r || !active) return;
+    const x = clamp01((clientX - r.left) / r.width);
+    const y = clamp01((clientY - r.top) / r.height);
+    if (active === 'text') onChange({ x, y });
+    else onChange({ tx: x, ty: y });
+  };
+  const has = callout.text.trim().length > 0;
+  const lineW = Math.max(0.5, (callout.size / 100) * 0.7);
+  return (
+    <div className="pill-item">
+      <div className="pill-head">
+        <input
+          className="text"
+          type="text"
+          placeholder={`Callout ${index + 1} — e.g. ONE PRESS`}
+          maxLength={PILL_MAX_LENGTH}
+          value={callout.text}
+          disabled={disabled}
+          onChange={(e) => onChange({ text: e.target.value })}
+        />
+        <button className="x" onClick={onRemove} disabled={disabled} aria-label={`Remove callout ${index + 1}`}>✕</button>
+      </div>
+      {has && (
+        <>
+          <div className="position">
+            <span className="muted">Drag the text, and the dot onto the part it should point at.</span>
+            <div
+              ref={frameRef}
+              className="placer"
+              style={{ aspectRatio: aspect, backgroundImage: preview ? `url(${preview})` : undefined }}
+              onPointerMove={(e) => active && moveTo(e.clientX, e.clientY)}
+              onPointerUp={() => setActive(null)}
+              onPointerCancel={() => setActive(null)}
+            >
+              {callout.pointer && (
+                <svg className="callout-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                  <line x1={callout.x * 100} y1={callout.y * 100} x2={callout.tx * 100} y2={callout.ty * 100} stroke={callout.color} strokeWidth={lineW} strokeLinecap="round" />
+                  <circle cx={callout.tx * 100} cy={callout.ty * 100} r={Math.max(1, lineW * 1.6)} fill={callout.color} />
+                </svg>
+              )}
+              <span
+                className="callout-text"
+                style={{ left: `${callout.x * 100}%`, top: `${callout.y * 100}%`, color: callout.color, fontSize: pillPreviewFont(callout.size) }}
+                onPointerDown={(e) => {
+                  if (disabled || e.button !== 0) return;
+                  setActive('text');
+                  frameRef.current?.setPointerCapture(e.pointerId);
+                }}
+              >
+                {callout.text || 'Label'}
+              </span>
+              {callout.pointer && (
+                <span
+                  className="callout-dot"
+                  style={{ left: `${callout.tx * 100}%`, top: `${callout.ty * 100}%`, color: callout.color }}
+                  onPointerDown={(e) => {
+                    if (disabled || e.button !== 0) return;
+                    setActive('target');
+                    frameRef.current?.setPointerCapture(e.pointerId);
+                  }}
+                />
+              )}
+            </div>
+            <XYNumbers x={callout.x} y={callout.y} disabled={disabled} onChange={(patch) => onChange(patch)} />
+          </div>
+          <div className="effects">
+            <label>
+              Text colour
+              <span className="color-row">
+                <input type="color" value={callout.color} disabled={disabled} onChange={(e) => onChange({ color: e.target.value })} />
+                <span className="meta">{callout.color.toUpperCase()}</span>
+              </span>
+            </label>
+            <label>
+              Text size
+              <span className="color-row">
+                <input type="range" min={PILL_SIZE.min} max={PILL_SIZE.max} step={PILL_SIZE.step} value={callout.size} disabled={disabled} onChange={(e) => onChange({ size: Number(e.target.value) })} />
+                <span className="meta">{callout.size}%</span>
+              </span>
+            </label>
+            <label className="toggle">
+              <input type="checkbox" checked={callout.pointer} disabled={disabled} onChange={(e) => onChange({ pointer: e.target.checked })} />
+              Show the pointer line
+            </label>
+          </div>
+          <CalloutTiming start={callout.start} end={callout.end} playLen={playLen} disabled={disabled} onChange={(patch) => onChange(patch)} />
+        </>
+      )}
+    </div>
+  );
+}
+
 /**
  * Shows a single decoded video frame at `time` (seconds), re-decoding a short moment after `time`
  * stops changing so dragging a trim handle doesn't trigger a decode on every step. Owns its object URL.
@@ -812,6 +966,7 @@ export default function App() {
       voiceTrim: { start: 0, end: 0 },
       images: [],
       pills: [],
+      callouts: [],
       trim: { start: 0, end: 0 },
       ...defaults,
     }));
@@ -850,6 +1005,11 @@ export default function App() {
   const addPill = (clip: Clip) => update(clip.id, { pills: [...clip.pills, makePill(pillDefaults)] });
   const removePill = (clipId: string, pillId: string) =>
     setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, pills: c.pills.filter((p) => p.id !== pillId) } : c)));
+  const updateCallout = (clipId: string, coId: string, patch: Partial<Callout>) =>
+    setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, callouts: c.callouts.map((o) => (o.id === coId ? { ...o, ...patch } : o)) } : c)));
+  const addCallout = (clip: Clip) => update(clip.id, { callouts: [...clip.callouts, makeCallout()] });
+  const removeCallout = (clipId: string, coId: string) =>
+    setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, callouts: c.callouts.filter((o) => o.id !== coId) } : c)));
   const updateTrim = (clip: Clip & { status: 'ready' }, patch: Partial<Trim>) => update(clip.id, { trim: { ...clip.trim, ...patch } });
 
   const updateImage = (clipId: string, imageId: string, patch: Partial<Overlay>) =>
@@ -1007,6 +1167,11 @@ export default function App() {
                     end: p.end,
                   },
                 ]
+              : [],
+          ),
+          callouts: c.callouts.flatMap((co) =>
+            co.text.trim()
+              ? [{ text: co.text, x: co.x, y: co.y, tx: co.tx, ty: co.ty, pointer: co.pointer, size: co.size, color: co.color, start: co.start, end: co.end }]
               : [],
           ),
         })),
@@ -1189,6 +1354,7 @@ export default function App() {
           voiceTrim: { start: 0, end: 0 },
           images,
           pills,
+          callouts: [],
           motion: bc.motion as Motion,
           motionSpeed: bc.motionSpeed as MotionSpeed,
           trim: { start: 0, end: 0 },
@@ -1642,6 +1808,26 @@ export default function App() {
                         ))}
                         <button type="button" className="slot-pick" disabled={busy} onClick={() => addPill(clip)}>
                           + Add {clip.pills.length ? 'another ' : ''}text pill
+                        </button>
+                      </div>
+
+                      <div className="pills">
+                        <span className="muted">Callouts — plain text that points at a part of the clip</span>
+                        {clip.callouts.map((co, cidx) => (
+                          <CalloutEditor
+                            key={co.id}
+                            callout={co}
+                            index={cidx}
+                            preview={clip.preview}
+                            aspect={aspect}
+                            playLen={playSeconds}
+                            disabled={busy}
+                            onChange={(patch) => updateCallout(clip.id, co.id, patch)}
+                            onRemove={() => removeCallout(clip.id, co.id)}
+                          />
+                        ))}
+                        <button type="button" className="slot-pick" disabled={busy} onClick={() => addCallout(clip)}>
+                          + Add {clip.callouts.length ? 'another ' : ''}callout
                         </button>
                       </div>
 
